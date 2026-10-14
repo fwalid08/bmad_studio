@@ -1,0 +1,62 @@
+{
+  "generation_hash": "996f9a0c3d5581e14bd3",
+  "inputs": {
+    "jinja2_version": "3.1.6",
+    "project_root": "/home/fwalid08/Projects/bmad_studio",
+    "renderer_sha256": "32010ee3b7828cc8cc421e94ca713cec2a861751d41ccaa4465d1c26e5b3c438",
+    "resolved_values": {
+      "config.core.output_folder": "/home/fwalid08/Projects/bmad_studio/_bmad-output",
+      "customization.workflow.activation_steps_append": [],
+      "customization.workflow.activation_steps_prepend": [],
+      "customization.workflow.implementation_handoff": "Launch a subagent with no prior conversation context, with this prompt:\n\n> Read {plan_file} fully and implement it — the plan is the sole source of truth. Load every file listed in its frontmatter `context:` before you start.\n>\n> When done, report what you changed, how you verified it, and anything left incomplete or risky.\n",
+      "customization.workflow.on_complete": "",
+      "customization.workflow.open_plan": "",
+      "customization.workflow.persistent_facts": [],
+      "customization.workflow.quick_lenses": [
+        {
+          "id": "quick",
+          "instruction": "Launch a context-free subagent with this prompt:\n\nRead `{plan_file}` — the plan holding the acceptance criteria and intent — and the files its frontmatter `context:` lists. Read the agent instruction files (`AGENTS.md`, `CLAUDE.md`, or equivalents) at the repository root and in the directories the diff touches; those are the rules. Then read the unified diff at `{diff_file}` — it is the change under review.\n\nReport unmet acceptance criteria, broken rules, and bugs. Each finding: the location, what goes wrong, and evidence checked against the surrounding code. Output a Markdown list of findings only — no severity, priority, or ranking.\n\nDo not invoke any skill, and do not spawn subagents of your own — you are the reviewer. Return your findings as text in your final message; do not route them through any findings-reporting tool the host may offer.\n\n",
+          "name": "Quick"
+        }
+      ],
+      "customization.workflow.review": "quick",
+      "customization.workflow.route": "auto",
+      "customization.workflow.route_selection": "Decide whether to use a coding subagent (full) or implement directly (oneshot).\nUsing the information already gathered, with no further reading and minimal\nextra reasoning, estimate the lines of code to add or modify.\n100 lines or fewer: oneshot. Otherwise: full.\nIf the change touches more than five files and is not simple or mechanical,\nconsider upgrading to full.\n",
+      "initiative_folder": "/home/fwalid08/Projects/bmad_studio/_bmad-output/initiative-brainstorming-guidance-formatting"
+    },
+    "skill_root": "/home/fwalid08/.agents/skills/bmad-build",
+    "source_sha256": {
+      "plan-template.md": "f27a97ac7e90b1d8c129e5836029dbef85263bce7d81399f3201970ef26b717c",
+      "references/claims-check.md": "6cb20a86d819b95272876bca0dffef59ca07ba6a373d804295066751043867c0",
+      "references/deletion-check.md": "0f1f124e4e957147e89164a272b10bedc694ad0d9ad2618c8610ac74ee9cb0da",
+      "review-prompts/edge-case-hunter.md": "b909fe0ec8e4daaf2550d0ec783618c5146261d0dbc0e054698ce00d0905a3d1",
+      "review-prompts/verification-gap.md": "45ab0b8c4c56c5c055c97a293a8591a67e256d0b1a2058ce1f093cd866be8d03",
+      "step-01-clarify-and-route.md": "55ba1c1bd4e144e8c765d2cbbc46308dcefc89f58441612ec2246076e476ca52",
+      "step-02-plan.md": "eb7abc40ee70a082165b4afcee7186d246960ae1ef677b92148d9d4737846c55",
+      "step-03-implement.md": "df1a0f8a8fdb524581d371505a12a33a25d5150ecb442a58a9d8145d2b284954",
+      "step-04-review.md": "6ced1bd56e56141860b32ad1c191616b281401706802a51f9fc464a09286262a",
+      "step-05-present.md": "8c3a4f5e627524b05c3f1db4850b6ab68ae6930d8046c340a3e1590dccc4ed61",
+      "step-oneshot.md": "1313ccda88e42fc813ed585bd2f3794480c33cb40dea674cb45ca860310dbf9e",
+      "workflow.md": "a4a1fed8a1d374b5ff8ac5613211a2e31d7e89743d1b153348ae6fe9ce36ec80"
+    }
+  },
+  "outputs": {
+    "plan-template.md": "f27a97ac7e90b1d8c129e5836029dbef85263bce7d81399f3201970ef26b717c",
+    "references/claims-check.md": "6cb20a86d819b95272876bca0dffef59ca07ba6a373d804295066751043867c0",
+    "references/deletion-check.md": "0f1f124e4e957147e89164a272b10bedc694ad0d9ad2618c8610ac74ee9cb0da",
+    "review-prompts/edge-case-hunter.md": "b909fe0ec8e4daaf2550d0ec783618c5146261d0dbc0e054698ce00d0905a3d1",
+    "review-prompts/verification-gap.md": "45ab0b8c4c56c5c055c97a293a8591a67e256d0b1a2058ce1f093cd866be8d03",
+    "step-01-clarify-and-route.md": "c169883ce133c95ee31080d90c9f1b5af2694a039fb73e14b748bf156894056e",
+    "step-02-plan.md": "21e8561281d71fb3ae261188942688f70f5f8b61926aa44724d1f023defe4d85",
+    "step-03-implement.md": "86db12b0c8e71ab3616aeb201d614ab5c171f183be4f3afd992f55d7eb55f19d",
+    "step-04-review.md": "088cb7eead54cb505e86c8100665e3bab755d8aec288e4549b96781e5a2b3589",
+    "step-05-present.md": "edda56d0325a599734fef653501c2e56cd45ace615343113768b6a3f4f1b3540",
+    "step-oneshot.md": "4d3930b592e79c5e0613b9c7f09db4de157f724cb0cdc86dce8eceb2b91fb3c1",
+    "workflow.md": "c99656a5dd25530f2a809ab5ceec1449c90865d11bfb3650ba1b3c0b77bd925d"
+  },
+  "project_root": "/home/fwalid08/Projects/bmad_studio",
+  "project_slug": "bmad-studio",
+  "root_hash": "fb89708e40e5",
+  "schema_version": 1,
+  "skill": "bmad-build"
+}

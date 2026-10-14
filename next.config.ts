@@ -4,6 +4,8 @@ const nextConfig: NextConfig = {
   /* config options here */
   cacheComponents: true,
   partialPrefetching: true,
+  // The OpenCode client runs on the server only (never shipped to the browser).
+  serverExternalPackages: ["@opencode/client"],
   turbopack: {
     rules: {
       "*.css": {
@@ -12,6 +14,7 @@ const nextConfig: NextConfig = {
       },
     },
   },
+  allowedDevOrigins: ['192.168.1.60']
 };
 
 export default nextConfig;
