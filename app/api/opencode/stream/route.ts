@@ -50,67 +50,72 @@ export async function POST(req: Request) {
       };
       const emit = (e: ActivityEvent) => send("log", e);
 
-      try {
-        const client = await clientFor();
+      const client = await clientFor();
 
-        const sm = body.model ? splitModel(body.model) : undefined;
-        const sessionId = await ensureSession(client.session, {
-          directory: body.directory,
-          sessionId: body.sessionId,
-          title: body.title ?? "BMAD Build",
-          agent: body.agent,
-          model: sm ? { id: sm.modelID, providerID: sm.providerID } : undefined,
-        });
-        send("session", { sessionId });
+      const sm = body.model ? splitModel(body.model) : undefined;
+      const sessionId = await ensureSession(client.session, {
+        directory: body.directory,
+        sessionId: body.sessionId,
+        title: body.title ?? "BMAD Build",
+        agent: body.agent,
+        model: sm ? { id: sm.modelID, providerID: sm.providerID } : undefined,
+      });
+      send("session", { sessionId });
 
-        // Subscribe BEFORE prompting so we don't miss early events.
-        const eventStream = client.event.subscribe();
+      // When the client disconnects (user clicked Stop), interrupt the OpenCode session.
+      req.signal.addEventListener("abort", () => {
+        client.session.interrupt({ sessionID: sessionId }).catch(() => {});
+      });
 
-        // Fire the prompt asynchronously; completion is driven by the event loop.
-        // Agent/model switch first when provided (session may pre-exist).
-        if (body.agent) {
-          await client.session.switchAgent({ sessionID: sessionId, agent: body.agent }).catch(() => {});
-        }
-        if (body.model) {
-          const m = splitModel(body.model);
-          await client.session
-            .switchModel({ sessionID: sessionId, model: { id: m.modelID, providerID: m.providerID } })
-            .catch(() => {});
-        }
-        void client.session
-          .prompt({ sessionID: sessionId, text: body.prompt })
-          .catch((err: unknown) => {
-            send("error", { message: err instanceof Error ? err.message : String(err) });
-          });
+      // Subscribe BEFORE prompting so we don't miss early events.
+      const eventStream = client.event.subscribe();
 
-        for await (const event of eventStream as AsyncIterable<EventSubscribeOutput>) {
-          // Only react to events for our session (shared global stream).
-          const sid = (event.data as { sessionID?: string } | undefined)?.sessionID;
-          if (sid && sid !== sessionId) continue;
-
-          if (mapper.isTerminal(event, sessionId)) {
-            if (event.type === "session.execution.failed") {
-              const d = event.data as { error?: { message?: string } | string };
-              const msg =
-                (typeof d.error === "string" ? d.error : d.error?.message) ||
-                "OpenCode session error";
-              send("error", { message: msg });
-            }
-            break;
-          }
-          for (const e of mapper.map(event)) emit(e);
-        }
-
-        send("done", { ok: true });
-      } catch (e) {
-        send("error", { message: e instanceof Error ? e.message : String(e) });
-      } finally {
-        try {
-          controller.close();
-        } catch {
-          /* already closed */
-        }
+      // Fire the prompt asynchronously; completion is driven by the event loop.
+      // Agent/model switch first when provided (session may pre-exist).
+      if (body.agent) {
+        await client.session.switchAgent({ sessionID: sessionId, agent: body.agent }).catch(() => {});
       }
+      if (body.model) {
+        const m = splitModel(body.model);
+        await client.session
+          .switchModel({ sessionID: sessionId, model: { id: m.modelID, providerID: m.providerID } })
+          .catch(() => {});
+      }
+      void client.session
+        .prompt({ sessionID: sessionId, text: body.prompt })
+        .catch((err: unknown) => {
+          send("error", { message: err instanceof Error ? err.message : String(err) });
+        });
+
+      try {
+        for await (const event of eventStream as AsyncIterable<EventSubscribeOutput>) {
+        // Only react to events for our session (shared global stream).
+        const sid = (event.data as { sessionID?: string } | undefined)?.sessionID;
+        if (sid && sid !== sessionId) continue;
+
+        if (mapper.isTerminal(event, sessionId)) {
+          if (event.type === "session.execution.failed") {
+            const d = event.data as { error?: { message?: string } | string };
+            const msg =
+              (typeof d.error === "string" ? d.error : d.error?.message) ||
+              "OpenCode session error";
+            send("error", { message: msg });
+          }
+          break;
+        }
+        for (const e of mapper.map(event)) emit(e);
+      }
+
+      send("done", { ok: true });
+    } catch (e) {
+      send("error", { message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      try {
+        controller.close();
+      } catch {
+        /* already closed */
+      }
+    }
     },
   });
 

@@ -1,15 +1,15 @@
 ---
-title: 'Fix New BMAD Project modal overflow'
-type: 'bugfix'
-ticket: ''
-created: '2026-10-14'
-status: 'done'
-baseline_revision: '2b310af6ad13dcd41dd88f325314981951074720'
-route: 'oneshot'
-route_source: 'auto'
-risk: 'low'
-review: ''
-review_source: ''
+title: "Fix New BMAD Project modal overflow"
+type: "bugfix"
+ticket: ""
+created: "2026-10-14"
+status: "done"
+baseline_revision: "2b310af6ad13dcd41dd88f325314981951074720"
+route: "oneshot"
+route_source: "auto"
+risk: "low"
+review: ""
+review_source: ""
 lenses_ran: []
 review_loop_iteration: 0
 context: []
@@ -32,7 +32,9 @@ Oneshot is appropriate because the expected source change is one className edit 
 ## Verification
 
 **Commands:**
+
 - `bun run lint` -- expected: ESLint completes without errors.
 
 **Manual checks:**
+
 - Open `/projects` at desktop and mobile widths; confirm all form content stays inside the dialog and no horizontal overflow appears.

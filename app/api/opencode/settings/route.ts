@@ -18,11 +18,19 @@ export async function PUT(request: Request) {
       opencodeServerUrl?: unknown;
       username?: unknown;
       password?: unknown;
+      defaultModel?: unknown;
+      defaultAgent?: unknown;
+      buildAgent?: unknown;
+      guidanceMode?: unknown;
     };
     const saved = await saveServerSettings({
       opencodeServerUrl: typeof body.opencodeServerUrl === "string" ? body.opencodeServerUrl : undefined,
       username: typeof body.username === "string" ? body.username : undefined,
       password: typeof body.password === "string" && body.password ? body.password : undefined,
+      defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : undefined,
+      defaultAgent: typeof body.defaultAgent === "string" ? body.defaultAgent : undefined,
+      buildAgent: typeof body.buildAgent === "string" ? body.buildAgent : undefined,
+      guidanceMode: typeof body.guidanceMode === "string" ? body.guidanceMode : undefined,
     });
     return NextResponse.json({
       ok: true,

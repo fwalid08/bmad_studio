@@ -1,16 +1,16 @@
 ---
-title: 'Browse Local Directories in Project Picker'
-type: 'feature'
-ticket: ''
-created: '2026-10-14'
-status: 'built'
-baseline_revision: '2b310af6ad13dcd41dd88f325314981951074720'
-route: 'oneshot'
-route_source: 'auto'
-risk: 'medium'
-review: 'quick'
-review_source: 'pinned'
-lenses_ran: ['quick']
+title: "Browse Local Directories in Project Picker"
+type: "feature"
+ticket: ""
+created: "2026-10-14"
+status: "built"
+baseline_revision: "2b310af6ad13dcd41dd88f325314981951074720"
+route: "oneshot"
+route_source: "auto"
+risk: "medium"
+review: "quick"
+review_source: "pinned"
+lenses_ran: ["quick"]
 review_loop_iteration: 0
 context: []
 ---
@@ -28,11 +28,13 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
+
 - [x] `app/api/opencode/directories/route.ts` -- list child directories for a requested path, defaulting to the user's home -- provide local filesystem data without exposing file contents.
 - [x] `lib/opencode/client.ts` -- add the typed directories fetch helper -- keep API calls behind the existing client abstraction.
 - [x] `components/bmad/directory-picker.tsx` -- add parent/child navigation and a way to select the displayed folder -- make local folders selectable without removing OpenCode project shortcuts or path entry.
 
 **Acceptance Criteria:**
+
 - Given a local directory not known to OpenCode, when the user browses to it and selects it, then its absolute path becomes the project working directory.
 - Given a directory containing subdirectories, when the user opens it in the picker, then only child directories are listed and the user can navigate to the parent.
 - Given an invalid or unreadable path, when the picker requests its contents, then it displays a useful error and remains usable.
@@ -52,11 +54,13 @@ Quick review identified directory symlinks being omitted. The route now follows 
 ## Verification
 
 **Commands:**
+
 - `bun run lint` -- expected: ESLint completes without errors.
 - `bun run build` -- expected: Next.js production build completes.
 - `curl` against `/api/opencode/directories?path=...` -- returned local child directories including the workspace.
 
 **Manual checks:**
+
 - Open the project picker, browse to a local folder that is not an OpenCode project, select it, and confirm its absolute path is used.
 - Navigate into a child and back to its parent; verify OpenCode project shortcuts and manual path entry still work.
 - Browser verification confirmed local folder navigation and selection updated the working-directory input without saving a project.

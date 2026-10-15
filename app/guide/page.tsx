@@ -399,7 +399,9 @@ export default function GuidePage() {
               <CardTitle className="flex items-center gap-2 text-base"><HelpCircle className="size-4" /> Di mana data saya disimpan?</CardTitle>
               <CardDescription>
                 Semua proyek dan artefak disimpan secara lokal di browser Anda (localStorage).
-                Membersihkan data browser akan menghapusnya — gunakan <strong>Export</strong> untuk
+                Pengaturan (server URL, model/agent default) disimpan di file JSON
+                (`~/.config/bmad-studio/opencode.json`) di mesin ini.
+                Membersihkan data browser akan menghapus proyek — gunakan <strong>Export</strong> untuk
                 menyimpan salinan artefak penting.
               </CardDescription>
             </CardHeader>

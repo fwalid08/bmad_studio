@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Plus, ArrowRight, Trash2, Boxes, Pencil } from "lucide-react";
+import { Plus, ArrowRight, Boxes } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -32,6 +32,7 @@ import { projectProgress, nextStepId, nextRequiredSteps } from "@/lib/progress";
 import { stepById } from "@/lib/bmad/roadmap";
 import { useHydrated } from "@/lib/use-hydrated";
 import { DirectoryPicker } from "@/components/bmad/directory-picker";
+import { EditProjectButton, DeleteProjectButton } from "@/components/bmad/project-actions";
 import type { ProjectScale } from "@/lib/bmad/types";
 
 const SCALE_INFO: Record<ProjectScale, { label: string; hint: string }> = {
@@ -43,8 +44,6 @@ const SCALE_INFO: Record<ProjectScale, { label: string; hint: string }> = {
 export default function ProjectsPage() {
   const projects = useStudio((s) => s.projects);
   const createProject = useStudio((s) => s.createProject);
-  const deleteProject = useStudio((s) => s.deleteProject);
-  const setProjectDirectory = useStudio((s) => s.setProjectDirectory);
   const router = useRouter();
   const mounted = useHydrated();
   const [open, setOpen] = useState(false);
@@ -52,7 +51,6 @@ export default function ProjectsPage() {
   const [description, setDescription] = useState("");
   const [scale, setScale] = useState<ProjectScale>("light");
   const [directory, setDirectory] = useState("");
-  const [editing, setEditing] = useState<string | null>(null);
 
   const canCreate = Boolean(name.trim() && directory.trim());
 
@@ -149,33 +147,9 @@ export default function ProjectsPage() {
                     <Badge variant="secondary" className="text-[10px] uppercase">{SCALE_INFO[p.scale].label}</Badge>
                   </div>
                   {p.description && <p className="text-muted-foreground line-clamp-2 text-sm">{p.description}</p>}
-                  <div className="flex items-center gap-1.5 pt-1">
-                    <code className="text-muted-foreground flex-1 truncate text-[11px]" title={p.directory}>
-                      {p.directory || "no directory set"}
-                    </code>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="size-6"
-                      title="Change working directory"
-                      onClick={() => setEditing(editing === p.id ? null : p.id)}
-                    >
-                      <Pencil className="size-3" />
-                    </Button>
-                  </div>
-                  {editing === p.id && (
-                    <div className="pt-2 flex flex-col items-start space-y-2">
-                      <DirectoryPicker
-                        value={p.directory}
-                        onChange={(dir) => {
-                          if (dir && dir !== p.directory) setProjectDirectory(p.id, dir);
-                        }}
-                      />
-                      <p className="text-muted-foreground pt-1 text-[11px]">
-                        Changing the directory resets this project&apos;s chat session.
-                      </p>
-                    </div>
-                  )}
+                  <code className="text-muted-foreground block truncate pt-1 text-[11px]" title={p.directory}>
+                    {p.directory || "no directory set"}
+                  </code>
                 </CardHeader>
                 <CardContent className="flex flex-1 flex-col gap-3">
                   <div className="space-y-1">
@@ -196,9 +170,10 @@ export default function ProjectsPage() {
                     <Link href={`/projects/${p.id}`}>
                       <Button size="sm" variant="outline">Open <ArrowRight className="size-4" /></Button>
                     </Link>
-                    <Button size="sm" variant="ghost" className="text-muted-foreground hover:text-destructive" onClick={() => deleteProject(p.id)}>
-                      <Trash2 className="size-4" />
-                    </Button>
+                    <div className="flex items-center gap-1">
+                      <EditProjectButton project={p} />
+                      <DeleteProjectButton project={p} />
+                    </div>
                   </div>
                 </CardContent>
               </Card>

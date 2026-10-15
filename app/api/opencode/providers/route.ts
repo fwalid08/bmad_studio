@@ -29,9 +29,13 @@ export async function GET() {
     const modelsByProvider = new Map<string, ProviderInfo["models"]>();
     for (const m of modelsOut.data ?? []) {
       const list = modelsByProvider.get(m.providerID) ?? [];
+      // Normalize to the fully-qualified "providerID/modelID" form so ids are
+      // unique across providers; skip exact duplicates from the server.
+      const id = m.id?.includes("/") ? m.id : `${m.providerID}/${m.modelID}`;
+      if (list.some((existing) => existing.id === id)) continue;
       const isConnected = connected.has(m.providerID) || m.providerID === "opencode";
       list.push({
-        id: m.id,
+        id,
         providerID: m.providerID,
         modelID: m.modelID,
         name: m.name || m.modelID,
@@ -65,7 +69,11 @@ export async function GET() {
       return a.name.localeCompare(b.name);
     });
 
-    return NextResponse.json({ providers });
+    // Every integration ID the server accepts keys for (used by Settings to
+    // warn before saving a key for an unknown provider instead of failing).
+    const integrationIds = [...new Set((integrationsOut.data ?? []).map((i) => i.id))].sort();
+
+    return NextResponse.json({ providers, integrationIds });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Failed to list providers";
     return NextResponse.json({ error: message }, { status: 502 });

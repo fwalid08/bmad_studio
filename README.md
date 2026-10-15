@@ -1,7 +1,7 @@
 # BMAD Studio
 
 A guided web studio for creating software with the **BMAD Method**
-(*Agile AI-Driven Development*). Move a project through the method's phases —
+(_Agile AI-Driven Development_). Move a project through the method's phases —
 **Clarify → Plan → Ship** — producing the same artifacts BMAD expects (Brief,
 PRD, DESIGN/EXPERIENCE, Architecture, Epics & Stories, `sprint-status.yaml`),
 with the five BMAD specialist agents guiding each step.
@@ -62,12 +62,15 @@ Use only for local/personal projects — **never on a public deployment**. (The
 OpenCode SDK is server-only; externalized via `serverExternalPackages` and never
 shipped to the browser.)
 
-Routes: `/api/opencode/{providers,auth/[id],projects,agents,sessions,messages,chat,stream,status}`.
+Routes: `/api/opencode/{providers,auth/[id],projects,agents,sessions,messages,chat,stream,status}`
+
+- `/api/ai/{providers,chat}` (Direct AI: OpenAI-compatible providers, no OpenCode).
 
 ## Tech stack
 
 Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS v4 ·
-shadcn/ui (Radix) · Zustand (persisted to `localStorage`) ·
+shadcn/ui (Radix) · Zustand (projects persisted to `localStorage`;
+settings persisted to `~/.config/bmad-studio/opencode.json`) ·
 OpenCode (agentic coding backend via its local server + official SDK) · bun.
 
 ## Getting started
@@ -114,13 +117,16 @@ components/
   layout/               site-header
 lib/
   bmad/                 roadmap, agents, templates, types (the BMAD model)
+  ai/                   Direct AI (server key storage, chat completions, client)
   opencode/             OpenCode integration (server, client, events, messages, types)
-  store.ts              Zustand store (projects, artifacts, settings)
+  store.ts              Zustand store (projects in localStorage, settings in JSON file)
 ```
 
 ## Notes & next steps
 
-- Project metadata + artifacts are stored locally in the browser. API keys and
+- Project metadata + artifacts are stored locally in the browser. Settings
+  (server URL, default model/agents) are stored in
+  `~/.config/bmad-studio/opencode.json` on this machine. API keys and
   sessions live on the OpenCode server. The store is structured so it can be
   migrated to a backend (Postgres/Supabase) and multi-user auth later.
 - The roadmap, agent roster, skill codes, and artifact names mirror the official

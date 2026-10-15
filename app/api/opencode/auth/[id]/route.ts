@@ -25,7 +25,21 @@ export async function PUT(
     await client.integration.connect.key({ integrationID: id, key });
     return NextResponse.json({ ok: true });
   } catch (e) {
-    const message = e instanceof Error ? e.message : "Failed to set API key";
-    return NextResponse.json({ error: message }, { status: 502 });
+    const raw = e instanceof Error ? e.message : "Failed to set API key";
+    // The OpenCode server only accepts keys for integration IDs it knows.
+    // Translate its terse "Integration not found" into something actionable.
+    if (/integration not found/i.test(raw)) {
+      return NextResponse.json(
+        {
+          error:
+            `OpenCode server doesn't recognize provider "${id}". ` +
+            `It has no integration with that ID, so the key can't be saved. ` +
+            `Pick a provider from the server list, or set the key via its ` +
+            `environment variable / opencode.json custom provider instead.`,
+        },
+        { status: 422 },
+      );
+    }
+    return NextResponse.json({ error: raw }, { status: 502 });
   }
 }

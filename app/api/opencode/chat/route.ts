@@ -20,8 +20,9 @@ interface ChatBody {
 }
 
 // Guidance / draft endpoint: sends one message to the project's OpenCode session
-// and waits for the reply. Tools are disabled so the model answers with plain
-// text (no file edits) — ideal for BMAD agent guidance and artifact drafting.
+// and waits for the reply. NOTE: OpenCode's prompt `metadata` is inert passthrough
+// data — it is NOT applied as a system prompt. So caller-provided `system`
+// instructions are prepended to the message text to guarantee the model sees them.
 export async function POST(req: Request) {
   let body: ChatBody;
   try {
@@ -59,8 +60,7 @@ export async function POST(req: Request) {
 
     await client.session.prompt({
       sessionID: sessionId,
-      text: body.message,
-      ...(body.system ? { metadata: { system: body.system } } : {}),
+      text: body.system ? `${body.system}\n\n---\n\n${body.message}` : body.message,
     });
 
     const text = await waitForAssistantReply(

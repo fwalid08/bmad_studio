@@ -1,15 +1,15 @@
 ---
-title: 'Format Brainstorming Agent Guidance'
-type: 'bugfix'
-ticket: ''
-created: '2026-10-15'
-status: 'built'
-baseline_revision: '2b310af6ad13dcd41dd88f325314981951074720'
-route: 'oneshot'
-route_source: 'auto'
-risk: 'low'
-review: 'quick'
-review_source: 'pinned'
+title: "Format Brainstorming Agent Guidance"
+type: "bugfix"
+ticket: ""
+created: "2026-10-15"
+status: "built"
+baseline_revision: "2b310af6ad13dcd41dd88f325314981951074720"
+route: "oneshot"
+route_source: "auto"
+risk: "low"
+review: "quick"
+review_source: "pinned"
 lenses_ran: []
 review_loop_iteration: 0
 context: []
@@ -34,5 +34,6 @@ Focused tests and lint passed. An independent reviewer was not launched because 
 ## Verification
 
 **Commands:**
+
 - `bun test lib/bmad/agent-output.test.ts` -- expected: focused guidance contract tests pass.
 - `bun run lint -- components/bmad/agent-panel.tsx lib/bmad/agent-output.ts lib/bmad/agent-output.test.ts` -- expected: ESLint completes without errors for touched files.
