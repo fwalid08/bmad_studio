@@ -379,7 +379,8 @@ export default function GuidePage() {
                 Build dijalankan <strong>langsung di folder working directory Anda</strong> oleh
                 agent OpenCode dengan tools-nya (menulis file, menjalankan shell). Karena kode
                 berjalan <strong>di server lokal</strong>, gunakan hanya untuk proyek lokal/pribadi.
-                Agen build otomatis menyetujui izin (permission) yang muncul agar berjalan penuh.
+                Izin (permission) tool disetujui otomatis agar build berjalan penuh; jika agen
+                mengajukan pertanyaan, dialog muncul agar Anda bisa menjawab dan melanjutkan build.
                 Biaya mengikuti penyedia model masing-masing.
               </p>
             </CardContent>

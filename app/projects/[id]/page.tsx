@@ -3,7 +3,7 @@
 import { Suspense } from "react";
 import Link from "next/link";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
-import { ArrowLeft, Rocket, ArrowRight, RefreshCcw, Plus, FolderGit2 } from "lucide-react";
+import { ArrowLeft, Rocket, ArrowRight, RefreshCcw, FolderGit2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -24,7 +24,6 @@ function Workspace() {
   const router = useRouter();
   const hydrated = useHydrated();
   const projects = useStudio((s) => s.projects);
-  const setProjectSession = useStudio((s) => s.setProjectSession);
   const clearProjectSession = useStudio((s) => s.clearProjectSession);
 
   const id = typeof params.id === "string" ? params.id : undefined;
@@ -46,16 +45,6 @@ function Workspace() {
     }
     const qs = q.toString();
     router.replace(`/projects/${id}${qs ? `?${qs}` : ""}`);
-  }
-
-  async function createFreshSession() {
-    if (!project?.directory) return;
-    try {
-      const res = await opencode.createSession(project.directory, `${project.name} — BMAD`);
-      setProjectSession(project.id, res.id);
-    } catch {
-      // no-op here; user can retry from the app or inspect OpenCode status
-    }
   }
 
   async function resetSession() {
@@ -118,11 +107,8 @@ function Workspace() {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <Button size="sm" variant="outline" onClick={createFreshSession} disabled={!project.directory}>
-            <Plus className="size-4" /> New session
-          </Button>
           <Button size="sm" variant="ghost" onClick={resetSession} disabled={!project.sessionId}>
-            <RefreshCcw className="size-4" /> Reset session
+            <RefreshCcw className="size-4" /> Hapus session
           </Button>
         </div>
       </div>
