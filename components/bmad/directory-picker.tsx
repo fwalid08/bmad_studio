@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { ArrowUp, Folder, FolderOpen, RefreshCw, Loader2, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,6 +17,7 @@ interface Props {
 
 // Lets the user pick any local folder, an OpenCode project, or type an absolute path.
 export function DirectoryPicker({ value, onChange }: Props) {
+  const inputId = useId();
   const [projects, setProjects] = useState<OpenCodeProject[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -88,9 +89,9 @@ export function DirectoryPicker({ value, onChange }: Props) {
   }, []);
 
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <Label htmlFor="dir">Working directory</Label>
+    <div className="w-full min-w-0 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={inputId}>Working directory</Label>
         <Button type="button" variant="ghost" size="sm" onClick={refresh} disabled={loading}>
           {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
           <span className="ml-1 text-xs">Refresh</span>
@@ -98,7 +99,7 @@ export function DirectoryPicker({ value, onChange }: Props) {
       </div>
 
       <Input
-        id="dir"
+        id={inputId}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="/absolute/path/to/project"
@@ -162,7 +163,7 @@ export function DirectoryPicker({ value, onChange }: Props) {
                   title={directory.path}
                 >
                   <Folder className="size-3.5 shrink-0" />
-                  <span className="truncate font-mono">{directory.name}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono">{directory.name}</span>
                 </button>
               ))
             ) : (
@@ -195,8 +196,8 @@ export function DirectoryPicker({ value, onChange }: Props) {
                 title={p.worktree}
               >
                 {active ? <FolderOpen className="size-3.5 shrink-0" /> : <Folder className="size-3.5 shrink-0" />}
-                <span className="truncate font-mono">{p.worktree}</span>
-                {active && <Badge variant="secondary" className="ml-auto text-[10px]">selected</Badge>}
+                <span className="min-w-0 flex-1 truncate font-mono">{p.worktree}</span>
+                {active && <Badge variant="secondary" className="ml-auto shrink-0 text-[10px]">selected</Badge>}
               </button>
             );
           })}

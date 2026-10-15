@@ -53,6 +53,59 @@ export interface Artifact {
   updatedAt: string;
 }
 
+/** Status kolom di papan Eksekusi. */
+export type TaskStatus = "backlog" | "todo" | "in-progress" | "review" | "done";
+
+/** Ringkasan satu run build pada task (log penuh hanya di memori sesi). */
+export interface TaskBuild {
+  id: string;
+  goal: string;
+  status: "running" | "done" | "error" | "stopped";
+  startedAt: string;
+  finishedAt?: string;
+  elapsedMs?: number;
+  eventCount: number;
+  /** Path file yang tersentuh agen (diekstrak dari judul tool). */
+  files: string[];
+}
+
+/** Satu unit kerja di papan Eksekusi (story/task). */
+export interface ExecTask {
+  id: string;
+  title: string;
+  detail: string;
+  epic: string;
+  /** Tag bebas, misal: frontend, bug, urgent. */
+  tags: string[];
+  /** Prioritas pengerjaan — menentukan urutan "kerjakan berikutnya". */
+  priority: TaskPriority;
+  status: TaskStatus;
+  /** Riwayat build terakhir (maks 3, terbaru dulu). */
+  builds?: TaskBuild[];
+  /**
+   * Session khusus task ini. Jika undefined, build memakai project.sessionId
+   * (shared session). Saat user klik "New session", field ini diisi dengan
+   * session id baru dan semua build berikutnya berjalan di session terisolasi.
+   */
+  sessionId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Prioritas task: high dikerjakan dulu. */
+export type TaskPriority = "high" | "medium" | "low";
+
+/** Satu sprint: kelompok task + nama dan tujuan. */
+export interface Sprint {
+  id: string;
+  name: string;
+  goal: string;
+  taskIds: string[];
+  status: "active" | "done";
+  createdAt: string;
+  closedAt?: string;
+}
+
 /** A guided question used by the local wizard for a step. */
 export interface WizardQuestion {
   id: string;
@@ -73,6 +126,10 @@ export interface Project {
   updatedAt: string;
   /** Keyed by StepId. */
   artifacts: Record<string, Artifact>;
+  /** Papan Eksekusi — daftar story/task (opsional untuk migrasi project lama). */
+  tasks?: ExecTask[];
+  /** Daftar sprint (opsional untuk migrasi project lama). */
+  sprints?: Sprint[];
   /**
    * Absolute path to the project working directory (folder). This MUST match a
    * project/directory known to the local OpenCode server — every chat session
@@ -98,4 +155,20 @@ export interface Settings {
   defaultAgent?: string;
   /** Agent name used for build turns (e.g. "build"). */
   buildAgent?: string;
+  /**
+   * Which backend answers BMAD guidance/draft turns: the local OpenCode
+   * server (`"opencode"`) or a provider called directly (`"direct"`).
+   * Build turns always use OpenCode.
+   */
+  guidanceMode?: "opencode" | "direct";
+  /**
+   * How prior-phase context reaches a draft turn: ship every artifact
+   * (`"full"`) or embed them (bge-m3) and ship outline + top-k chunks
+   * (`"retrieval"`).
+   */
+  contextMode?: "full" | "retrieval";
+  /** Direct AI provider used for embeddings (defaults to the Direct default). */
+  embeddingProviderId?: string;
+  /** Embedding model id, e.g. "bge-m3". */
+  embeddingModel?: string;
 }
