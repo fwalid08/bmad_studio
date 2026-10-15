@@ -14,25 +14,29 @@ import {
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { useStudio } from "@/lib/store";
 import { useHydrated } from "@/lib/use-hydrated";
-import { stepById, PHASES, stepsForScale } from "@/lib/bmad/roadmap";
+import { stepById, PHASES, STEPS, stepsForScale } from "@/lib/bmad/roadmap";
 import { PlanOverview } from "@/components/bmad/plan-overview";
 import { TEMPLATES, draftSkeleton } from "@/lib/bmad/templates";
 import { normalizeMarkdown } from "@/lib/bmad/markdown";
 import { markdownOutline } from "@/lib/bmad/chunking";
 import { buildDraftContext } from "@/lib/bmad/context";
 import { agentForStep } from "@/lib/bmad/agents";
+import { projectFiles } from "@/lib/project-files/client";
+import { useNotifications } from "@/components/ui/notifications";
 import { nextStepId } from "@/lib/progress";
 import { PhaseStepper } from "@/components/bmad/phase-stepper";
 import { ArtifactEditor, type DraftMode } from "@/components/bmad/artifact-editor";
 import { AgentPanel } from "@/components/bmad/agent-panel";
 import { opencode } from "@/lib/opencode/client";
 import { directAI } from "@/lib/ai/client";
-import type { Project, StepId } from "@/lib/bmad/types";
+import type { Project, StepId, ArtifactStatus } from "@/lib/bmad/types";
 
 export function PlanWorkspace({ project }: { project: Project }) {
   const settings = useStudio((s) => s.settings);
   const setArtifactContent = useStudio((s) => s.setArtifactContent);
+  const updateProject = useStudio((s) => s.updateProject);
   const setProjectSession = useStudio((s) => s.setProjectSession);
+  const notify = useNotifications();
   const mounted = useHydrated();
   const searchParams = useSearchParams();
   const router = useRouter();
@@ -93,6 +97,57 @@ export function PlanWorkspace({ project }: { project: Project }) {
   const hasSeedArtifact = Object.values(project.artifacts).some((a) =>
     a.content.trim().length > 0
   );
+
+  /**
+   * Simpan artefak ke store; saat status "complete" langsung tulis/update
+   * SEMUA artefak berisi ke folder project (docs/bmad/).
+   * Sync mencakup semua file supaya stempel lastFolderSyncAt tetap akurat
+   * (tidak menandai draft lain yang belum tersync sebagai sudah sync).
+   * Sync gagal → status tetap complete, user diberi notifikasi error.
+   */
+  async function handleSaveArtifact(
+    stepId: StepId,
+    content: string,
+    status: ArtifactStatus
+  ) {
+    setArtifactContent(project.id, stepId, content, status);
+    if (status !== "complete") return;
+    if (!project.directory) {
+      notify({
+        kind: "info",
+        title: "Artefak complete (belum tersimpan ke folder)",
+        description: "Set working directory dulu lalu klik Sync folder.",
+      });
+      return;
+    }
+    // Baca project paling segar (setArtifactContent di atas sudah applied)
+    // supaya file yang baru di-complete ikut ter-sync.
+    const fresh = useStudio.getState().getProject(project.id) ?? project;
+    const step = stepById(stepId);
+    const files = STEPS.map((s) => ({
+      filename: s.output,
+      content: s.id === stepId ? content : (fresh.artifacts[s.id]?.content ?? ""),
+    })).filter((f) => f.content.trim().length > 0);
+    if (files.length === 0) return;
+    try {
+      const res = await projectFiles.sync(project.directory, files);
+      updateProject(project.id, { lastFolderSyncAt: new Date().toISOString() });
+      notify({
+        kind: "success",
+        title: `Tersimpan ke ${step?.output ?? "folder project"}`,
+        description:
+          `Artefak langsung ditulis ke docs/bmad/ folder project` +
+          (res.written.length > 1 ? ` (${res.written.length} file).` : "."),
+      });
+    } catch (e) {
+      notify({
+        kind: "error",
+        title: "Gagal menyimpan ke folder project",
+        description:
+          e instanceof Error ? e.message : "Sync gagal — coba Sync folder manual.",
+      });
+    }
+  }
 
   async function elaborateStep(stepId: StepId): Promise<string | null> {
     // Always read the freshest project so chained drafts (bulk mode) build on
@@ -334,7 +389,9 @@ export function PlanWorkspace({ project }: { project: Project }) {
                 project={project}
                 draftMode={draftMode}
                 onDraftModeChange={setDraftMode}
-                onSave={(content, status) => setArtifactContent(project.id, selectedStep.id, content, status)}
+                onSave={(content, status) =>
+                  void handleSaveArtifact(selectedStep.id, content, status)
+                }
                 prevStep={
                   prevNavId && stepById(prevNavId)
                     ? { id: prevNavId, name: stepById(prevNavId)!.name }

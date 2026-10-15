@@ -49,7 +49,7 @@ interface Props {
   project: Project;
   draftMode: DraftMode;
   onDraftModeChange: (m: DraftMode) => void;
-  onSave: (content: string, status: ArtifactStatus) => void;
+  onSave: (content: string, status: ArtifactStatus) => void | Promise<void>;
   prevStep: StepNav | null;
   nextStep: StepNav | null;
   onNavigate: (stepId: StepId) => void;
@@ -78,6 +78,7 @@ export function ArtifactEditor({
   const [content, setContent] = useState(artifact?.content ?? "");
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  const [completing, setCompleting] = useState(false);
 
   // Sync external updates (e.g. "Buatkan draft" from the agent card).
   useEffect(() => {
@@ -113,13 +114,21 @@ export function ArtifactEditor({
   }
 
   function handleSave(status: ArtifactStatus) {
-    setSaving(status === "draft");
-    try {
-      onSave(content, status);
-    } finally {
-      // store update is sync; release the spinner on next tick
-      setTimeout(() => setSaving(false), 400);
+    if (status === "draft") {
+      setSaving(true);
+      try {
+        void onSave(content, status);
+      } finally {
+        // store update is sync; release the spinner on next tick
+        setTimeout(() => setSaving(false), 400);
+      }
+      return;
     }
+    // Mark complete: tahan spinner sampai auto-save folder selesai.
+    setCompleting(true);
+    void Promise.resolve(onSave(content, status)).finally(() => {
+      setTimeout(() => setCompleting(false), 400);
+    });
   }
 
   function download() {
@@ -231,10 +240,15 @@ export function ArtifactEditor({
             <Button
               size="sm"
               onClick={() => handleSave("complete")}
-              disabled={!content.trim()}
+              disabled={!content.trim() || completing}
               className="bg-emerald-500 text-white shadow-md shadow-emerald-500/30 hover:bg-emerald-400"
             >
-              <Check className="size-4" /> Mark complete
+              {completing ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Check className="size-4" />
+              )}{" "}
+              {completing ? "Menyimpan…" : "Mark complete"}
             </Button>
           ) : (
             <Button

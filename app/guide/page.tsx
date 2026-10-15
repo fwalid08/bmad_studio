@@ -242,8 +242,9 @@ export default function GuidePage() {
           </div>
           <p className="mb-3">
             Gunakan tombol <strong>Mark complete</strong> (atau <strong>Reopen</strong> untuk
-            membukanya kembali) di kanan atas editor. Menandai selesai akan memperbarui progres di
-            roadmap dan halaman Projects.
+            membukanya kembali) di kanan atas editor. Mark complete otomatis
+            menyimpan artefak ke folder project (<code>docs/bmad/</code>) dan
+            memperbarui progres di roadmap dan halaman Projects.
           </p>
           <p>
             Untuk membawa artefak ke alat coding AI Anda (tepat seperti yang dimaksudkan BMAD),
