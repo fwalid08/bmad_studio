@@ -1,4 +1,119 @@
-import type { Project } from "@/lib/bmad/types";
+import type { Project, TaskPriority } from "@/lib/bmad/types";
+
+/** Kandidat story hasil breakdown agen (siap preview + impor). */
+export interface BreakdownCandidate {
+  title: string;
+  detail: string;
+  epic: string;
+  priority: TaskPriority;
+  tags: string[];
+}
+
+/** Normalisasi prioritas jawaban agen → TaskPriority. */
+function normalizePriority(v: unknown): TaskPriority {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (/^(p1|high|tinggi|urgent|critical|duluan|must)/.test(s)) return "high";
+  if (/^(p3|low|rendah|later|nice)/.test(s)) return "low";
+  return "medium";
+}
+
+/** Normalisasi tags jawaban agen → string[] bersih. */
+function normalizeTags(v: unknown): string[] {
+  const arr = Array.isArray(v) ? v : typeof v === "string" ? v.split(/[,#\n]/) : [];
+  return [...new Set(
+    arr.map((t) => String(t ?? "").trim().replace(/^#/, "").toLowerCase()).filter(Boolean),
+  )].slice(0, 5);
+}
+
+/** Ambil kandidat array JSON seimbang `[ ... ]` di luar fence (jawaban agen longgar). */
+function extractBalancedArray(text: string): string[] {
+  const out: string[] = [];
+  for (let start = 0; start < text.length; start++) {
+    if (text[start] !== "[") continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+      } else {
+        if (ch === '"') inStr = true;
+        else if (ch === "[") depth++;
+        else if (ch === "]") {
+          depth--;
+          if (depth === 0) {
+            out.push(text.slice(start, i + 1));
+            start = i;
+            break;
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function toCandidate(o: {
+  title?: unknown;
+  detail?: unknown;
+  epic?: unknown;
+  priority?: unknown;
+  tags?: unknown;
+}): BreakdownCandidate | null {
+  const rawTitle = String(o.title ?? "").trim();
+  if (rawTitle.length < 4) return null;
+  const title = rawTitle.length > 140 ? `${rawTitle.slice(0, 140)}…` : rawTitle;
+  const detail = String(o.detail ?? "").trim() || title;
+  return {
+    title,
+    detail,
+    epic: String(o.epic ?? "").trim().slice(0, 80),
+    priority: normalizePriority(o.priority),
+    tags: normalizeTags(o.tags),
+  };
+}
+
+/** Parse jawaban breakdown agen menjadi kandidat stories siap preview + impor.
+ *  Terima ```json tasks [...] di fence maupun array JSON longgar di luar fence;
+ *  perbaiki trailing comma; cap 40 item; dedup by title. */
+export function parseAgentBreakdown(text: string): BreakdownCandidate[] {
+  const raw = (text ?? "").replace(/,\s*([\}\]])/g, "$1");
+  const candidates: string[] = [];
+  const fenceRe = /```(?:json\s+tasks|tasks|json\s+sprint|sprint|json)?\s*\n([\s\S]*?)```/gi;
+  let m: RegExpExecArray | null;
+  while ((m = fenceRe.exec(raw)) !== null) {
+    const body = m[1].trim();
+    if (/["']?taskTitles["']?\s*:/.test(body)) continue;
+    candidates.push(body);
+    const arrMatch = body.match(/\[[\s\S]*\]/);
+    if (arrMatch) candidates.push(arrMatch[0]);
+  }
+  // Fallback: array seimbang di luar fence.
+  candidates.push(...extractBalancedArray(raw));
+  const seen = new Set<string>();
+  const out: BreakdownCandidate[] = [];
+  for (const cand of candidates) {
+    try {
+      const parsed: unknown = JSON.parse(cand);
+      const arr = Array.isArray(parsed) ? parsed : (parsed as { tasks?: unknown }).tasks;
+      if (!Array.isArray(arr)) continue;
+      for (const item of arr) {
+        const c = toCandidate((item ?? {}) as { title?: unknown; detail?: unknown; epic?: unknown; priority?: unknown; tags?: unknown });
+        if (!c) continue;
+        const k = c.title.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(c);
+        if (out.length >= 40) return out;
+      }
+      if (out.length > 0) return out;
+    } catch { /* coba kandidat berikutnya */ }
+  }
+  return out;
+}
 
 /** Ambil blok ```json tasks [...] / ```json sprint — sumber kebenaran impor. */
 function parseMachineTasks(combined: string): Array<{ title: string; detail: string; epic: string; fromMachine: boolean }> {
@@ -147,7 +262,6 @@ export function suggestTasksFromArtifacts(project: Project): Array<{ title: stri
     if (!stripped || stripped.startsWith("#") || stripped.startsWith("_Generated") || stripped.startsWith("```") || /^\|.*\|$/.test(stripped)) continue;
     const line = cleanMd(stripped);
     if (!line) continue;
-    const low = line.toLowerCase();
 
     // Header / catatan artefak — lewati.
     if (/^(basis|readiness|development_status|notes|catatan)\b/i.test(line) && line.length < 80 && !/[:—–-]\s*\S.{10,}/.test(line)) continue;
