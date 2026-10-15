@@ -3,7 +3,7 @@
 import { Suspense } from "react";
 import Link from "next/link";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
-import { ArrowLeft, Rocket, ArrowRight, RefreshCcw, FolderGit2 } from "lucide-react";
+import { ArrowLeft, Rocket, ArrowRight, FolderGit2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -12,7 +12,6 @@ import { PlanWorkspace } from "@/components/bmad/plan-workspace";
 import { ExecutionPanel } from "@/components/bmad/execution-panel";
 import { EditProjectButton } from "@/components/bmad/project-actions";
 import { useStudio } from "@/lib/store";
-import { opencode } from "@/lib/opencode/client";
 import { nextStepId, projectProgress } from "@/lib/progress";
 import { useHydrated } from "@/lib/use-hydrated";
 import { stepById, PHASES, stepsForScale } from "@/lib/bmad/roadmap";
@@ -24,7 +23,6 @@ function Workspace() {
   const router = useRouter();
   const hydrated = useHydrated();
   const projects = useStudio((s) => s.projects);
-  const clearProjectSession = useStudio((s) => s.clearProjectSession);
 
   const id = typeof params.id === "string" ? params.id : undefined;
   const project = id ? projects.find((p) => p.id === id) : undefined;
@@ -45,16 +43,6 @@ function Workspace() {
     }
     const qs = q.toString();
     router.replace(`/projects/${id}${qs ? `?${qs}` : ""}`);
-  }
-
-  async function resetSession() {
-    if (!project?.directory || !project.sessionId) return;
-    try {
-      await opencode.deleteSession(project.directory, project.sessionId);
-      clearProjectSession(project.id);
-    } catch {
-      // no-op here; if delete fails, leave the current session intact
-    }
   }
 
   if (!hydrated) {
@@ -91,25 +79,9 @@ function Workspace() {
               <h1 className="truncate text-xl font-bold tracking-tight">{project.name}</h1>
               <EditProjectButton project={project} />
               <Badge variant="secondary" className="text-[11px] capitalize">{project.scale}</Badge>
-              {project.sessionId ? (
-                <span className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
-                  <span className="relative flex size-1.5">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60" />
-                    <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
-                  </span>
-                  Session aktif
-                </span>
-              ) : (
-                <span className="text-muted-foreground text-[11px]">Tanpa session</span>
-              )}
             </div>
             <p className="text-muted-foreground line-clamp-1 text-sm">{project.description || "BMAD workspace"}</p>
           </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button size="sm" variant="ghost" onClick={resetSession} disabled={!project.sessionId}>
-            <RefreshCcw className="size-4" /> Hapus session
-          </Button>
         </div>
       </div>
 
