@@ -68,11 +68,11 @@ export function FolderSyncButtons({ project }: { project: Project }) {
   }
 
   return (
-    <div className="space-y-2">
-      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+    <div className="mt-3 space-y-1.5">
+      <div className="grid grid-cols-2 gap-2 rounded-lg border bg-muted/50 p-2">
         <Button
           variant="outline"
-          className="justify-start"
+          className="w-full justify-center bg-background"
           disabled={!hasDirectory || syncing}
           onClick={handleSyncToFolder}
           title="Tulis semua artefak ke docs/bmad/ folder project (membuka tab Eksekusi)"
@@ -81,7 +81,7 @@ export function FolderSyncButtons({ project }: { project: Project }) {
         </Button>
         <Button
           variant="outline"
-          className="justify-start"
+          className="w-full justify-center bg-background"
           disabled={!hasDirectory || importing}
           onClick={handleImportFromFolder}
           title="Baca artefak dari docs/bmad/ folder project"

@@ -3,7 +3,7 @@
 import { Suspense } from "react";
 import Link from "next/link";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
-import { ArrowLeft, Rocket, ArrowRight, FolderGit2 } from "lucide-react";
+import { ArrowLeft, Rocket, ArrowRight, FolderGit2, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -11,11 +11,28 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { PlanWorkspace } from "@/components/bmad/plan-workspace";
 import { ExecutionPanel } from "@/components/bmad/execution-panel";
 import { EditProjectButton } from "@/components/bmad/project-actions";
+import { FolderSyncButtons } from "@/components/bmad/folder-sync-buttons";
 import { useStudio } from "@/lib/store";
 import { nextStepId, projectProgress } from "@/lib/progress";
 import { useHydrated } from "@/lib/use-hydrated";
-import { stepById, PHASES, stepsForScale } from "@/lib/bmad/roadmap";
+import { stepById, PHASES, stepsForScale, STEPS } from "@/lib/bmad/roadmap";
 import { agentForStep } from "@/lib/bmad/agents";
+import { useNotifications } from "@/components/ui/notifications";
+
+/** True bila masih ada artefak berisi yang BELUM tersinkron ke folder project:
+ *  belum pernah sync, atau ada artefak yang diubah setelah stempel sync terakhir. */
+function hasUnsyncedArtifacts(project: NonNullable<ReturnType<typeof useStudio.getState>["projects"][number]>): boolean {
+  const hasContent = STEPS.some((s) => project.artifacts[s.id]?.content.trim());
+  if (!hasContent) return false; // belum ada isi → tidak ada yang perlu disync
+  const stamp = project.lastFolderSyncAt ? Date.parse(project.lastFolderSyncAt) : NaN;
+  if (!Number.isFinite(stamp)) return true;
+  return STEPS.some((s) => {
+    const a = project.artifacts[s.id];
+    if (!a?.content.trim()) return false;
+    const t = Date.parse(a.updatedAt);
+    return Number.isFinite(t) && t > stamp;
+  });
+}
 
 function Workspace() {
   const params = useParams();
@@ -23,15 +40,28 @@ function Workspace() {
   const router = useRouter();
   const hydrated = useHydrated();
   const projects = useStudio((s) => s.projects);
+  const notify = useNotifications();
 
   const id = typeof params.id === "string" ? params.id : undefined;
   const project = id ? projects.find((p) => p.id === id) : undefined;
 
   const urlTab = searchParams.get("tab");
-  const tab = urlTab === "eksekusi" ? "eksekusi" : "rencana";
+  const unsynced = project ? hasUnsyncedArtifacts(project) : false;
+  // Tab Eksekusi terkunci sampai artefak tersinkron; URL ?tab=eksekusi paksa
+  // fallback ke Rencana supaya project lama yang sudah "terlanjur" tidak aneh.
+  const tab = urlTab === "eksekusi" && !unsynced ? "eksekusi" : "rencana";
   const nextStep = project ? nextStepId(project) : undefined;
   const nextStepInfo = nextStep ? stepById(nextStep) : undefined;
   function setTab(v: string, stepId?: string) {
+    if (v === "eksekusi" && unsynced) {
+      notify({
+        kind: "error",
+        title: "Tab Eksekusi terkunci",
+        description:
+          "Artefak belum di-sync ke folder project. Klik Sync folder di card Progress workspace dulu.",
+      });
+      return;
+    }
     const q = new URLSearchParams(searchParams.toString());
     if (v === "eksekusi") {
       q.set("tab", "eksekusi");
@@ -66,7 +96,7 @@ function Workspace() {
 
   return (
     <main className="mx-auto w-full max-w-7xl flex-1 px-6 py-8">
-      <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="flex min-w-0 items-center gap-3">
           <Link href="/projects" className="shrink-0">
             <Button variant="ghost" size="icon"><ArrowLeft className="size-4" /></Button>
@@ -88,8 +118,11 @@ function Workspace() {
       <Tabs value={tab} onValueChange={(v) => setTab(v, searchParams.get("step") ?? undefined)} className="gap-4">
         <TabsList>
           <TabsTrigger value="rencana">Rencana</TabsTrigger>
-          <TabsTrigger value="eksekusi">
+          <TabsTrigger value="eksekusi" disabled={unsynced} title={unsynced ? "Artefak belum di-sync ke folder project — klik Sync folder dulu" : undefined}>
             <Rocket className="size-4" /> Eksekusi
+            {unsynced && (
+              <TriangleAlert className="size-3.5 text-amber-500" aria-label="Belum sync" />
+            )}
           </TabsTrigger>
         </TabsList>
         <TabsContent value="rencana" className="space-y-5">
@@ -146,6 +179,15 @@ function Workspace() {
                 {project.directory || "Belum ada working directory"}
               </code>
             </div>
+            <FolderSyncButtons project={project} />
+            {unsynced && (
+              <div className="flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-700 dark:text-amber-400">
+                <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
+                <span>
+                  Artefak belum di-sync ke folder project — tab <strong>Eksekusi</strong> terkunci. Klik <strong>Sync folder</strong> dulu.
+                </span>
+              </div>
+            )}
           </div>
           <PlanWorkspace project={project} />
         </TabsContent>
