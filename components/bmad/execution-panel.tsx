@@ -22,7 +22,7 @@ import { agentForStep } from "@/lib/bmad/agents";
 import { opencode } from "@/lib/opencode/client";
 import { flattenModels } from "@/lib/opencode/client";
 import { directAI } from "@/lib/ai/client";
-import { suggestTasksFromArtifacts, parseMachineSprint, taskStats } from "@/lib/execution/tasks";
+import { parseMachineSprint, parseAgentBreakdown, taskStats, type BreakdownCandidate } from "@/lib/execution/tasks";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useNotifications } from "@/components/ui/notifications";
@@ -292,9 +292,117 @@ export function ExecutionPanel({ project }: { project: Project }) {
   const [epicTitle, setEpicTitle] = useState("");
   const [epicDesc, setEpicDesc] = useState("");
   const [elaborating, setElaborating] = useState(false);
-  const [elaborateError, setElaborateError] = useState<string | null>(null);
   const [elaborated, setElaborated] = useState<Array<{ title: string; detail: string; epic: string; checked: boolean }>>([]);
+  const [elaborateError, setElaborateError] = useState<string | null>(null);
 
+  // Breakdown full artefak → stories oleh agen (John/PM)
+  const [breakdownOpen, setBreakdownOpen] = useState(false);
+  const [breakdownBusy, setBreakdownBusy] = useState(false);
+  const [breakdownError, setBreakdownError] = useState<string | null>(null);
+  const [breakdownRaw, setBreakdownRaw] = useState<string | null>(null);
+  const [breakdownItems, setBreakdownItems] = useState<Array<BreakdownCandidate & { checked: boolean; duplicate: boolean }>>([]);
+  const breakdownAbort = useRef<AbortController | null>(null);
+  const hasAnyArtifact = useMemo(
+    () => ["product-brief", "prfaq", "prd", "ux", "architecture", "epics-stories", "sprint-planning"].some((id) => project.artifacts[id]?.content?.trim()),
+    [project.artifacts],
+  );
+  const existingTitleList = useMemo(() => allTasks.map((t) => t.title.toLowerCase()), [allTasks]);
+
+  function breakdownSystem(): string {
+    const agent = agentForStep("epics-stories");
+    return `Kamu ${agent.name} (${agent.title}) di BMAD Studio. ${agent.essence} Gaya: ${agent.style} Jawab Bahasa Indonesia, ringkas, tanpa basa-basi.`;
+  }
+
+  function buildBreakdownPrompt(): string {
+    return `${artifactContext(project)}Project: ${project.name}\n${project.description ? `Deskripsi: ${project.description}\n` : ""}Tugas: pecah SELURUH artefak rencana di atas menjadi 8–25 stories konkret yang kecil (1–4 jam per story), tidak duplikat, urut dari prioritas tertinggi. Kelompokkan tiap story ke epic yang paling pas (pakai nama epic dari artefak bila ada). Tiap story wajib punya acceptance criteria bernomor di detail.\n\nAturan output KETAT — balas HANYA satu blok:\n\`\`\`json tasks\n[{"title": "aksi user yang spesifik", "epic": "nama epic", "priority": "high|medium|low", "tags": ["frontend"], "detail": "Story: Sebagai ... saya bisa ... agar ...\\nAkseptansi:\\n1. ...\\n2. ..."}]\n\`\`\`\nTanpa prosa di luar blok.`;
+  }
+
+  async function handleBreakdown() {
+    if (breakdownBusy || busy) return;
+    if (!hasAnyArtifact) {
+      notify({ kind: "error", title: "Belum ada artefak", description: "Isi tab Rencana dulu (PRD / arsitektur / epics) sebelum breakdown." });
+      return;
+    }
+    const isDirect = settings.guidanceMode === "direct";
+    const modelId = settings.defaultModel;
+    if (!isDirect && !modelId) {
+      notify({ kind: "error", title: "Belum ada model default", description: "Pilih model AI di Settings → OpenCode dulu, atau pindah ke mode Direct AI." });
+      return;
+    }
+    breakdownAbort.current?.abort();
+    const controller = new AbortController();
+    breakdownAbort.current = controller;
+    setBreakdownBusy(true);
+    setBreakdownError(null);
+    setBreakdownRaw(null);
+    setBreakdownItems([]);
+    setBreakdownOpen(true);
+    const t0 = Date.now();
+    try {
+      const system = breakdownSystem();
+      const prompt = buildBreakdownPrompt();
+      let text: string;
+      if (isDirect) {
+        // Direct AI: jangan kirim settings.defaultModel (format "provider/model"
+        // ala OpenCode) — biarkan server pakai model bawaan provider Direct
+        // aktif, kalau tidak provider balas 404 model not found.
+        const res = await directAI.chat({
+          system,
+          messages: [{ role: "user", content: prompt }],
+        });
+        text = res.text;
+      } else {
+        const res = await opencode.chat({
+          directory: project.directory,
+          sessionId: project.sessionId,
+          message: prompt,
+          system,
+          model: modelId,
+          agent: settings.defaultAgent,
+          title: `${project.name} — Breakdown stories`,
+          signal: controller.signal,
+        });
+        text = res.text;
+        if (res.sessionId && res.sessionId !== project.sessionId) setProjectSession(project.id, res.sessionId);
+      }
+      const raw = (text ?? "").trim();
+      setBreakdownRaw(raw || null);
+      const parsed = parseAgentBreakdown(raw);
+      if (parsed.length === 0) {
+        setBreakdownError("Agen tidak mengembalikan stories yang bisa diparse. Coba lagi atau lihat jawaban mentah di bawah.");
+        return;
+      }
+      setBreakdownItems(
+        parsed.map((c) => {
+          const low = c.title.toLowerCase();
+          const duplicate = existingTitleList.some((t) => t === low || t.includes(low) || low.includes(t));
+          return { ...c, checked: !duplicate, duplicate };
+        }),
+      );
+      notify({ kind: "success", title: "Breakdown selesai", description: `${parsed.length} stories dalam ${Math.round((Date.now() - t0) / 1000)}s — centang lalu impor.` });
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      const message = e instanceof Error ? e.message : "Breakdown gagal. Coba lagi.";
+      setBreakdownError(message);
+      notify({ kind: "error", title: "Breakdown gagal", description: message });
+    } finally {
+      setBreakdownBusy(false);
+      breakdownAbort.current = null;
+    }
+  }
+
+  function importBreakdown() {
+    const picked = breakdownItems.filter((i) => i.checked);
+    if (picked.length === 0) return;
+    const n = importTasks(
+      project.id,
+      picked.map((i) => ({ title: i.title, detail: i.detail, epic: i.epic, tags: i.tags, priority: i.priority })),
+    );
+    setBreakdownItems((prev) =>
+      prev.map((i) => (i.checked ? { ...i, checked: false, duplicate: true } : i)),
+    );
+    notify({ kind: "success", title: "Stories diimpor", description: `${n} story masuk backlog${picked.length - n > 0 ? `, ${picked.length - n} duplikat dilewati` : ""}.` });
+  }
   // Build dialog (form build + info task terpilih)
   const [buildDialogOpen, setBuildDialogOpen] = useState(false);
   const [buildFullscreen, setBuildFullscreen] = useState(false);
@@ -380,7 +488,6 @@ export function ExecutionPanel({ project }: { project: Project }) {
     { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0, runCount: 0, costUsd: 0, costRunCount: 0 }
   );
   const canResumeBuild = latestBuild?.status === "error" || latestBuild?.status === "stopped" || latestBuild?.status === "interrupted";
-  const suggestions = useMemo(() => suggestTasksFromArtifacts(project), [project]);
 
   useEffect(() => {
     let active = true;
@@ -463,44 +570,6 @@ export function ExecutionPanel({ project }: { project: Project }) {
     }
     setDialogOpen(false);
     notify({ kind: "success", title: editing ? "Task diperbarui" : "Task dibuat", description: fTitle.trim() });
-  }
-
-  // Preview impor: centang kandidat, tandai duplikat sebelum masuk papan.
-  const [importOpen, setImportOpen] = useState(false);
-  const [importChecks, setImportChecks] = useState<boolean[]>([]);
-  const existingTitles = useMemo(
-    () => new Set(allTasks.map((t) => t.title.toLowerCase())),
-    [allTasks]
-  );
-  const fromMachine = useMemo(
-    () => suggestions.some((s) => (s as { fromMachine?: boolean }).fromMachine),
-    [suggestions]
-  );
-
-  function openImport() {
-    if (suggestions.length === 0) {
-      const message = "Belum ada artefak Epics/Stories untuk diimpor — isi dulu di tab Rencana.";
-      setError(message);
-      notify({ kind: "error", title: "Impor task tidak tersedia", description: message });
-      return;
-    }
-    setError(null);
-    setImportChecks(suggestions.map((s) => !existingTitles.has(s.title.toLowerCase())));
-    setImportOpen(true);
-  }
-
-  function handleImportSelected() {
-    const chosen = suggestions.filter((_, i) => importChecks[i]);
-    const n = importTasks(project.id, chosen);
-    setImportOpen(false);
-    if (n === 0) {
-      const message = "Semua kandidat sudah ada di papan (duplikat).";
-      setError(message);
-      notify({ kind: "error", title: "Impor task gagal", description: message });
-    } else {
-      setError(null);
-      notify({ kind: "success", title: "Task berhasil diimpor", description: `${n} task ditambahkan.` });
-    }
   }
 
   function move(t: ExecTask, dir: -1 | 1) {
@@ -1201,14 +1270,9 @@ export function ExecutionPanel({ project }: { project: Project }) {
       <div className="flex flex-wrap items-center gap-2">
         <Button size="sm" onClick={openNew}><Plus className="size-4" /> Task baru</Button>
         <Button size="sm" variant="secondary" onClick={openEpic}><Sparkles className="size-4" /> Epic baru</Button>
+        <Button size="sm" variant="outline" onClick={handleBreakdown} disabled={breakdownBusy || busy || !hasAnyArtifact} title={hasAnyArtifact ? "Pecah seluruh artefak rencana jadi stories oleh agen" : "Isi artefak di tab Rencana dulu"}>{breakdownBusy ? <Loader2 className="size-4 animate-spin" /> : <Wand2 className="size-4" />} Breakdown</Button>
         <Button size="sm" variant="outline" onClick={() => openList("all")}><List className="size-4" /> Semua task ({allTasks.length})</Button>
         <Button size="sm" variant="outline" onClick={openSprintPlanner}><CalendarDays className="size-4" /> Susun sprint</Button>
-        <Button size="sm" variant="outline" onClick={openImport} disabled={suggestions.length === 0}>
-          <Wand2 className="size-4" /> Impor {suggestions.length > 0 ? `${suggestions.length} ` : ""}dari artefak{fromMachine ? " · akurat" : " · tebakan"}
-        </Button>
-        {suggestions.length === 0 && (
-          <span className="text-muted-foreground text-xs">Isi Epics & Stories di tab Rencana dulu untuk mengimpor otomatis.</span>
-        )}
       </div>
 
       {allTags.length > 0 && (
@@ -1546,42 +1610,73 @@ export function ExecutionPanel({ project }: { project: Project }) {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={importOpen} onOpenChange={setImportOpen}>
+      <Dialog open={breakdownOpen} onOpenChange={(v) => { if (!breakdownBusy) setBreakdownOpen(v); }}>
         <DialogContent className="flex max-h-[85vh] max-w-2xl flex-col overflow-hidden">
           <DialogHeader className="shrink-0">
-            <DialogTitle>Preview impor ({suggestions.length})</DialogTitle>
+            <DialogTitle>Breakdown artefak jadi stories</DialogTitle>
             <DialogDescription>
-              {fromMachine
-                ? "Dibaca dari blok mesin ```json tasks — akurat."
-                : "Tanpa blok mesin — hasil tebakan regex, periksa judul/detail sebelum impor."}
+              Agen John (PM) memecah PRD, arsitektur, UX, epics & sprint jadi stories kecil ber-acceptance criteria. Centang lalu impor ke backlog.
             </DialogDescription>
           </DialogHeader>
-          <ul className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1">
-            {suggestions.map((s, i) => {
-              const dup = existingTitles.has(s.title.toLowerCase());
-              return (
-                <li key={i} className={`flex items-start gap-2 rounded-md border p-2 text-xs ${dup ? "opacity-60" : ""}`}>
+          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+            {breakdownBusy && (
+              <div className="flex items-center gap-2 rounded-md border p-3 text-xs">
+                <Loader2 className="size-4 animate-spin" /> Agen membaca artefak & menyusun stories…
+                <Button size="sm" variant="ghost" className="ml-auto h-6 px-2 text-[11px]" onClick={() => breakdownAbort.current?.abort()}>Batal</Button>
+              </div>
+            )}
+            {breakdownError && <p className="text-destructive text-xs">{breakdownError}</p>}
+            {breakdownItems.length > 0 && (
+              <div className="flex items-center gap-2 text-[11px]">
+                <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => setBreakdownItems((prev) => prev.map((i) => ({ ...i, checked: !i.duplicate })))}>Pilih semua</Button>
+                <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => setBreakdownItems((prev) => prev.map((i) => ({ ...i, checked: false })))}>Bersihkan</Button>
+                <span className="text-muted-foreground ml-auto tabular-nums">{breakdownItems.filter((i) => i.checked).length}/{breakdownItems.length} dipilih</span>
+              </div>
+            )}
+            <ul className="space-y-1.5">
+              {breakdownItems.map((s, i) => (
+                <li key={i} className={`flex items-start gap-2 rounded-md border p-2 text-xs ${s.duplicate ? "opacity-60" : ""}`}>
                   <button
                     type="button"
-                    onClick={() => setImportChecks((prev) => prev.map((c, j) => (j === i ? !c : c)))}
-                    className={`mt-0.5 flex size-4 shrink-0 items-center justify-center rounded border ${importChecks[i] ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground/40"}`}
-                    aria-label="Pilih kandidat"
+                    onClick={() => setBreakdownItems((prev) => prev.map((c, j) => (j === i ? { ...c, checked: !c.checked } : c)))}
+                    className={`mt-0.5 flex size-4 shrink-0 items-center justify-center rounded border ${s.checked ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground/40"}`}
+                    aria-label="Pilih story"
                   >
-                    {importChecks[i] && <Check className="size-3" />}
+                    {s.checked && <Check className="size-3" />}
                   </button>
                   <span className="min-w-0 flex-1">
-                    <span className="block font-medium">{s.title} {dup && <Badge variant="outline" className="ml-1 text-[10px]">duplikat — dilewati</Badge>}</span>
+                    <span className="block font-medium">
+                      {s.title}{" "}
+                      <Badge variant={s.priority === "high" ? "destructive" : s.priority === "low" ? "outline" : "secondary"} className="ml-1 text-[10px]">{PRIORITY_LABEL[s.priority]}</Badge>
+                      {s.duplicate && <Badge variant="outline" className="ml-1 text-[10px]">duplikat — dilewati</Badge>}
+                    </span>
                     {s.epic && <span className="text-muted-foreground block truncate">Epic: {s.epic}</span>}
-                    {s.detail && <span className="text-muted-foreground block whitespace-pre-wrap">{s.detail.slice(0, 300)}</span>}
+                    {s.tags.length > 0 && (
+                      <span className="mt-0.5 flex flex-wrap gap-1">
+                        {s.tags.map((tag) => (<Badge key={tag} variant="outline" className="px-1 py-0 text-[10px]">#{tag}</Badge>))}
+                      </span>
+                    )}
+                    {s.detail && <span className="text-muted-foreground block whitespace-pre-wrap">{s.detail.slice(0, 400)}</span>}
                   </span>
                 </li>
-              );
-            })}
-          </ul>
+              ))}
+            </ul>
+            {breakdownRaw && breakdownItems.length === 0 && !breakdownBusy && (
+              <details className="rounded-md border p-2 text-[11px]">
+                <summary className="cursor-pointer font-medium">Lihat jawaban mentah agen</summary>
+                <pre className="text-muted-foreground mt-1 max-h-48 overflow-auto whitespace-pre-wrap">{breakdownRaw.slice(0, 4000)}</pre>
+              </details>
+            )}
+          </div>
           <DialogFooter className="shrink-0">
-            <Button variant="ghost" onClick={() => setImportOpen(false)}>Batal</Button>
-            <Button onClick={handleImportSelected} disabled={importChecks.filter(Boolean).length === 0}>
-              Impor {importChecks.filter(Boolean).length} ke Backlog
+            {!breakdownBusy && breakdownItems.length === 0 && (
+              <Button onClick={handleBreakdown} disabled={!hasAnyArtifact}>
+                <Wand2 className="size-4" /> Coba breakdown lagi
+              </Button>
+            )}
+            <Button variant="ghost" onClick={() => setBreakdownOpen(false)} disabled={breakdownBusy}>Tutup</Button>
+            <Button onClick={importBreakdown} disabled={breakdownItems.filter((i) => i.checked).length === 0}>
+              Impor {breakdownItems.filter((i) => i.checked).length} ke Backlog
             </Button>
           </DialogFooter>
         </DialogContent>
