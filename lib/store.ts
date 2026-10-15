@@ -37,7 +37,7 @@ export interface StudioState {
   projectsLoaded: boolean;
   createProject: (input: NewProjectInput) => string;
   deleteProject: (id: string) => void;
-  updateProject: (id: string, patch: { name?: string; description?: string; directory?: string }) => void;
+  updateProject: (id: string, patch: { name?: string; description?: string; directory?: string; lastFolderSyncAt?: string }) => void;
   getProject: (id: string) => Project | undefined;
   /** Attach the OpenCode chat session id to a project (created lazily). */
   setProjectSession: (projectId: string, sessionId: string | undefined) => void;
@@ -323,6 +323,8 @@ export const useStudio = create<StudioState>()(
               directory: nextDir,
               // Changing the working directory invalidates the chat session.
               sessionId: dirChanged ? undefined : p.sessionId,
+              // Ganti folder → stempel sync lama tidak berlaku lagi.
+              lastFolderSyncAt: dirChanged ? undefined : patch.lastFolderSyncAt !== undefined ? patch.lastFolderSyncAt : p.lastFolderSyncAt,
               updatedAt: new Date().toISOString(),
             };
           }),

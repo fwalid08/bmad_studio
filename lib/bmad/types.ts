@@ -113,6 +113,11 @@ export interface ExecTask {
   sessionId?: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Waktu terakhir artefak berhasil di-sync ke folder project (docs/bmad).
+   * Undefined untuk project lama (dianggap belum sync → tab Eksekusi terkunci).
+   */
+  lastFolderSyncAt?: string;
 }
 
 /** Prioritas task: high dikerjakan dulu. */
@@ -161,6 +166,12 @@ export interface Project {
   directory: string;
   /** The OpenCode chat session id used for guidance + build on this project. */
   sessionId?: string;
+  /**
+   * Waktu terakhir artefak berhasil di-sync ke folder project (docs/bmad).
+   * Undefined untuk project lama (dianggap belum sync → tab Eksekusi terkunci).
+   * Direset saat working directory berganti.
+   */
+  lastFolderSyncAt?: string;
 }
 
 /**
