@@ -1159,8 +1159,8 @@ export function ExecutionPanel({ project }: { project: Project }) {
           const pct = inSprint.length ? Math.round((done / inSprint.length) * 100) : 0;
           return (
             <div className="rounded-xl border border-primary/25 bg-gradient-to-br from-primary/[0.09] via-card to-card p-3 shadow-sm">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                <div className="min-w-0 flex-1">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                <div className="min-w-0 flex-1 sm:max-w-[70%]">
                   <p className="flex items-center gap-1.5 text-[11px] font-semibold tracking-[0.14em] text-primary uppercase">
                     <CalendarDays className="size-3.5" /> {activeSprint.name}
                   </p>
@@ -1168,24 +1168,24 @@ export function ExecutionPanel({ project }: { project: Project }) {
                   <p className="text-muted-foreground mt-1 text-[11px] tabular-nums">{done}/{inSprint.length} task selesai · {pct}%</p>
                   <Progress value={pct} className="mt-1.5 h-1.5" />
                 </div>
-                <div className="flex shrink-0 gap-1.5">
-                  <Button size="sm" variant="outline" onClick={() => openSprintPlanner()}>Susun ulang</Button>
-                  <Button size="sm" variant="ghost" onClick={() => closeSprint(project.id, activeSprint.id)}>Tutup sprint</Button>
+                <div className="flex shrink-0 gap-1.5 sm:ml-auto">
+                  <Button size="sm" className="bg-neutral-900 text-white hover:bg-neutral-800 hover:text-white dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200" onClick={() => openSprintPlanner()}>Susun ulang</Button>
+                  <Button size="sm" className="bg-neutral-900 text-white hover:bg-neutral-800 hover:text-white dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200" onClick={() => closeSprint(project.id, activeSprint.id)}>Tutup sprint</Button>
                 </div>
               </div>
             </div>
           );
         })()
       ) : nextUp ? (
-        <div className="flex flex-col gap-2 rounded-xl border border-primary/25 bg-gradient-to-br from-primary/[0.09] via-card to-card p-3 shadow-sm sm:flex-row sm:items-center">
-          <div className="min-w-0 flex-1">
+        <div className="flex flex-col gap-3 rounded-xl border border-primary/25 bg-gradient-to-br from-primary/[0.09] via-card to-card p-3 shadow-sm sm:flex-row sm:items-center">
+          <div className="min-w-0 flex-1 sm:max-w-[70%]">
             <p className="text-[11px] font-semibold tracking-[0.14em] text-primary uppercase">Kerjakan berikutnya</p>
             <p className="truncate text-sm font-bold">{nextUp.title}</p>
             <p className="text-muted-foreground truncate text-xs">
               {PRIORITY_LABEL[nextUp.priority ?? "medium"]} · {nextUp.status === "todo" ? "Sprint" : "Backlog"}{nextUp.epic ? ` · ${nextUp.epic}` : ""}
             </p>
           </div>
-          <Button size="sm" className="shrink-0" onClick={() => selectTask(nextUp.id)}>
+          <Button size="sm" className="shrink-0 bg-neutral-900 text-white hover:bg-neutral-800 hover:text-white sm:ml-auto dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200" onClick={() => selectTask(nextUp.id)}>
             Buka task <ArrowRight className="size-4" />
           </Button>
         </div>
@@ -1745,45 +1745,42 @@ export function ExecutionPanel({ project }: { project: Project }) {
                 </div>
               </div>
 
-              <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3 overflow-hidden lg:grid-cols-[2fr_3fr] lg:grid-rows-1">
-                <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto rounded-md border bg-card p-3 shadow-sm lg:col-span-1">
-                {/* Form build */}
-                <div className="flex min-h-0 flex-1 flex-col gap-2.5">
-                  {!ready && (
-                    <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
-                      <FolderX className="mt-0.5 size-4 shrink-0" /><p>Set working directory dulu di header project.</p>
-                    </div>
-                  )}
-                  <div className="space-y-1.5">
-                    <Label>Mode</Label>
-                    <div className="grid grid-cols-2 rounded-md border p-1" role="group" aria-label="Mode eksekusi">
-                      <Button type="button" size="sm" variant="ghost" className={runMode === "build" ? "bg-emerald-600 text-white hover:bg-emerald-700 hover:text-white" : ""} aria-pressed={runMode === "build"} onClick={() => setRunMode("build")} disabled={selectedTaskDone || busy || reviewing}>
-                        <Rocket className="size-3.5" /> Build
-                      </Button>
-                      <Button type="button" size="sm" variant="ghost" className={runMode === "review" ? "bg-sky-600 text-white hover:bg-sky-700 hover:text-white" : ""} aria-pressed={runMode === "review"} onClick={() => setRunMode("review")} disabled={selectedTaskDone || busy || reviewing}>
-                        <Search className="size-3.5" /> Review
-                      </Button>
-                    </div>
+              <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 gap-3 overflow-y-auto lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] lg:overflow-hidden">
+                {/* Kolom kiri: dua row — atas form build, bawah box file tersentuh */}
+                <div className="flex min-h-0 min-w-0 flex-col gap-3 lg:overflow-hidden">
+                  {/* Row atas: form build (auto height, tidak fill) */}
+                  <div className="shrink-0 rounded-md border bg-card p-3 shadow-sm">
+                    {!ready && (
+                      <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
+                        <FolderX className="mt-0.5 size-4 shrink-0" /><p>Set working directory dulu di header project.</p>
+                      </div>
+                    )}
+                    <div className="flex flex-col gap-2.5">
+                  <div className="grid grid-cols-2 rounded-md border p-1" role="group" aria-label="Mode eksekusi">
+                    <Button type="button" size="sm" variant="ghost" className={runMode === "build" ? "bg-emerald-600 text-white hover:bg-emerald-700 hover:text-white" : ""} aria-pressed={runMode === "build"} onClick={() => setRunMode("build")} disabled={selectedTaskDone || busy || reviewing}>
+                      <Rocket className="size-3.5" /> Build
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" className={runMode === "review" ? "bg-sky-600 text-white hover:bg-sky-700 hover:text-white" : ""} aria-pressed={runMode === "review"} onClick={() => setRunMode("review")} disabled={selectedTaskDone || busy || reviewing}>
+                      <Search className="size-3.5" /> Review
+                    </Button>
                   </div>
                   <div className="space-y-1.5">
                     <Label>Model</Label>
-                    {!busy && (
-                      <Select value={buildModel} disabled={selectedTaskDone || reviewing} onValueChange={(modelId) => updateSettings({ defaultModel: modelId })}>
-                        <SelectTrigger className="w-full min-w-0" aria-label="Model untuk build">
-                          <SelectValue placeholder="Pilih model" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {buildModel && !models.some((model) => model.id === buildModel) && (
-                            <SelectItem value={buildModel}>{buildModel}</SelectItem>
-                          )}
-                          {models.map((model) => (
-                            <SelectItem key={model.id} value={model.id}>
-                              {model.name} — {model.id}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    )}
+                    <Select value={buildModel} disabled={selectedTaskDone || busy || reviewing} onValueChange={(modelId) => updateSettings({ defaultModel: modelId })}>
+                      <SelectTrigger className="w-full min-w-0" aria-label="Model untuk build">
+                        <SelectValue placeholder="Pilih model" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {buildModel && !models.some((model) => model.id === buildModel) && (
+                          <SelectItem value={buildModel}>{buildModel}</SelectItem>
+                        )}
+                        {models.map((model) => (
+                          <SelectItem key={model.id} value={model.id}>
+                            {model.name} — {model.id}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between gap-2">
@@ -1821,24 +1818,42 @@ export function ExecutionPanel({ project }: { project: Project }) {
                     {!busy && lastDoneAt && !error && <span className="text-xs text-emerald-600 sm:col-span-2">Selesai {new Date(lastDoneAt).toLocaleTimeString()}</span>}
                   </div>
                   {error && <p className="text-destructive text-xs">{error}</p>}
-                  {events.length > 0 && extractFiles(events).length > 0 && (
-                    <div className="flex min-h-0 flex-1 flex-col gap-1">
-                      <p className="text-muted-foreground text-[11px]">File tersentuh · {extractFiles(events).length}</p>
-                      <ul className="min-h-0 flex-1 list-inside list-disc space-y-1 overflow-y-auto pl-1 marker:text-muted-foreground">
-                        {extractFiles(events).map((file) => <li key={file} className="min-w-0"><code className="break-all font-mono text-[10px]">{file}</code></li>)}
-                      </ul>
-                    </div>
-                  )}
+                  </div>
+                  </div>
+                  {/* Row bawah: box file tersentuh (tersendiri dari form build, mengisi sisa ruang) */}
+                  <div className="flex min-h-40 flex-1 flex-col overflow-hidden rounded-md border bg-muted/30 p-3">
+                    {(() => {
+                      const touchedFiles = extractFiles(events);
+                      if (events.length === 0 || touchedFiles.length === 0) {
+                        return <p className="text-muted-foreground text-[11px]">Belum ada file tersentuh.</p>;
+                      }
+                      return (
+                        <>
+                          <div className="mb-2 flex shrink-0 items-center justify-between gap-2">
+                            <p className="text-muted-foreground text-[11px] font-medium">File tersentuh</p>
+                            <Badge variant="outline" className="text-[10px]">{touchedFiles.length}</Badge>
+                          </div>
+                          <ul className="min-h-0 flex-1 list-inside list-disc space-y-1 overflow-y-auto pl-1 marker:text-muted-foreground">
+                            {touchedFiles.map((file) => (
+                              <li key={file} className="min-w-0">
+                                <code className="break-all font-mono text-[10px]">{file}</code>
+                              </li>
+                            ))}
+                          </ul>
+                        </>
+                      );
+                    })()}
+                  </div>
                 </div>
-                </div>
-                <div className="flex min-h-0 min-w-0 flex-col gap-1.5 overflow-hidden rounded-md border bg-card p-3 shadow-sm lg:col-span-1">
-                  <Tabs value={buildDetailsTab} onValueChange={(value) => setBuildDetailsTab(value as "history" | "activity" | "review")} className="flex min-h-0 flex-1 flex-col">
+                {/* Kolom kanan: tabs riwayat + review + aktivitas, full height */}
+                <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+                  <Tabs value={buildDetailsTab} onValueChange={(value) => setBuildDetailsTab(value as "history" | "activity" | "review")} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                     <TabsList className="grid w-full shrink-0 grid-cols-3">
                       <TabsTrigger value="history" disabled={busy || reviewing}>Riwayat build ({(selected.builds ?? []).length})</TabsTrigger>
                       <TabsTrigger value="review" disabled={busy}>Review</TabsTrigger>
                       <TabsTrigger value="activity">Aktivitas</TabsTrigger>
                     </TabsList>
-                    <TabsContent value="activity" className="mt-2 flex min-h-0 flex-1 flex-col gap-2">
+                    <TabsContent value="activity" className="mt-2 min-h-0 flex-1 flex-col gap-2 overflow-hidden data-[state=active]:flex data-[state=inactive]:hidden">
                       <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-2.5 py-1.5">
                         <div className="min-w-0">
                           <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Session</p>
@@ -1858,9 +1873,9 @@ export function ExecutionPanel({ project }: { project: Project }) {
                         </span>
                         <span>{events.length} event</span>
                       </div>
-                      <ActivityLog events={events} className="h-auto min-h-0 flex-1" />
+                      <ActivityLog events={events} className="h-auto min-h-0 flex-1 overflow-y-auto" />
                     </TabsContent>
-                    <TabsContent value="review" className="mt-2 flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+                    <TabsContent value="review" className="mt-2 min-h-0 flex-1 flex-col gap-2 overflow-y-auto data-[state=active]:flex data-[state=inactive]:hidden">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <p className="text-sm font-semibold">Review implementasi</p>
                         {reviewing ? (
@@ -1904,11 +1919,11 @@ export function ExecutionPanel({ project }: { project: Project }) {
                         <p className="text-muted-foreground rounded-md border border-dashed p-4 text-center text-xs">Belum ada review implementasi untuk task ini.</p>
                       )}
                     </TabsContent>
-                    <TabsContent value="history" className="mt-2 min-h-0 flex-1 overflow-y-auto">
+                    <TabsContent value="history" className="mt-2 min-h-0 flex-1 flex-col overflow-y-auto data-[state=active]:flex data-[state=inactive]:hidden">
                       {(selected.builds ?? []).length === 0 ? (
                         <p className="text-muted-foreground rounded-md border border-dashed p-4 text-center text-xs">Belum ada riwayat build.</p>
                       ) : (
-                        <div className="space-y-2">
+                        <div className="min-h-0 flex-1 space-y-2">
                           <div className="flex items-center justify-between gap-3 border-b px-1 pb-2">
                             <div>
                               <p className="text-xs font-semibold">Total penggunaan task</p>
