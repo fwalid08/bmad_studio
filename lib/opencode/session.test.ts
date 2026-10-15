@@ -23,6 +23,25 @@ test("reuses a session that still exists", async () => {
   assert.equal(created, false);
 });
 
+test("creates a new session when no task session is assigned", async () => {
+  let listed = false;
+  const session = {
+    list: async () => {
+      listed = true;
+      return { data: [{ id: "other-task-session" }] };
+    },
+    create: async () => ({ id: "new-task-session" }),
+  };
+
+  const sessionId = await ensureSession(session, {
+    directory: "/project",
+    title: "Task build",
+  });
+
+  assert.equal(sessionId, "new-task-session");
+  assert.equal(listed, false);
+});
+
 test("creates a replacement when the saved session was deleted", async () => {
   const session = {
     list: async () => ({ data: [{ id: "other" }] }),
