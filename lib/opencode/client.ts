@@ -4,10 +4,12 @@
 import type {
   ActivityEvent,
   ChatMessage,
+  HaltRequest,
   ModelOption,
   OpenCodeAgent,
   OpenCodeProject,
   ProviderInfo,
+  TokenUsage,
 } from "./types";
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
@@ -19,11 +21,12 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-const post = <T,>(url: string, body: unknown) =>
+const post = <T,>(url: string, body: unknown, init?: RequestInit) =>
   json<T>(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    ...init,
   });
 
 export const opencode = {
@@ -87,12 +90,28 @@ export const opencode = {
     agent?: string;
     /** Session title when creating a new one. */
     title?: string;
+    signal?: AbortSignal;
   }) =>
-    post<{ text: string; sessionId: string }>("/api/opencode/chat", input),
+    post<{ text: string; sessionId: string; usage?: TokenUsage }>("/api/opencode/chat", input, { signal: input.signal }),
 
   /** Create a fresh session for a project directory (title optional). */
   createSession: (directory: string, title?: string) =>
     post<{ id: string; title: string }>("/api/opencode/sessions", { directory, title }),
+
+  /** Approve/reject a tool permission the build stream paused on. */
+  replyPermission: (input: {
+    sessionId: string;
+    id: string;
+    decision: "once" | "always" | "reject";
+    message?: string;
+  }) => post<{ ok: true }>("/api/opencode/halt", { ...input, kind: "permission" }),
+
+  /** Answer a question the build agent paused on. */
+  replyForm: (input: {
+    sessionId: string;
+    id: string;
+    answer: Record<string, string | number | boolean | string[]>;
+  }) => post<{ ok: true }>("/api/opencode/halt", { ...input, kind: "form" }),
 };
 
 /** Flatten providers into a single list of selectable model options. */
@@ -113,4 +132,4 @@ export function flattenModels(providers: ProviderInfo[]): ModelOption[] {
   return out;
 }
 
-export type { ActivityEvent, ChatMessage, ModelOption, OpenCodeAgent, OpenCodeProject, ProviderInfo };
+export type { ActivityEvent, ChatMessage, HaltRequest, ModelOption, OpenCodeAgent, OpenCodeProject, ProviderInfo };

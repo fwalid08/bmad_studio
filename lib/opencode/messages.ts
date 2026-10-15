@@ -2,15 +2,60 @@
 // Client-safe (type-only) so both server routes and, if needed, the UI can use it.
 
 import type { SessionMessageInfo } from "@opencode/client";
+import type { TokenUsage } from "./types";
 
 type SessionMessage = SessionMessageInfo;
 type AssistantContent = Extract<SessionMessage, { type: "assistant" }>["content"][number];
+
+type MessageUsageSource = {
+  id: string;
+  type: string;
+  cost?: number;
+  tokens?: {
+    input?: number;
+    output?: number;
+    reasoning?: number;
+    cache?: { read?: number; write?: number };
+  };
+};
 
 export interface UiMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
   createdAt: number;
+}
+
+/** Sum usage from assistant messages not present in the pre-run snapshot. */
+export function aggregateTokenUsage(
+  messages: readonly MessageUsageSource[] | undefined,
+  previousMessageIds?: ReadonlySet<string>
+): TokenUsage | undefined {
+  if (!messages) return undefined;
+
+  const usage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+  let hasTokens = false;
+  let costUsd = 0;
+  let hasCost = false;
+  const value = (amount: unknown) => typeof amount === "number" && Number.isFinite(amount) ? amount : 0;
+
+  for (const message of messages) {
+    if (message.type !== "assistant" || previousMessageIds?.has(message.id) || !message.tokens) continue;
+    hasTokens = true;
+    usage.input += value(message.tokens.input);
+    usage.output += value(message.tokens.output);
+    usage.reasoning += value(message.tokens.reasoning);
+    usage.cacheRead += value(message.tokens.cache?.read);
+    usage.cacheWrite += value(message.tokens.cache?.write);
+    if (typeof message.cost === "number" && Number.isFinite(message.cost)) {
+      costUsd += message.cost;
+      hasCost = true;
+    }
+  }
+
+  if (!hasTokens) return undefined;
+  usage.total = usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite;
+  return { ...usage, costUsd: hasCost ? costUsd : undefined };
 }
 
 /** Extract display text from one v2 session message. */

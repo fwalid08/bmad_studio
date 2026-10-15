@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { clientFor } from "@/lib/opencode/server";
 import { splitModel } from "@/lib/opencode/messages";
+import { aggregateTokenUsage } from "@/lib/opencode/messages";
 import { waitForAssistantReply } from "@/lib/opencode/chat-wait";
 import { ensureSession } from "@/lib/opencode/session";
 
@@ -58,6 +59,14 @@ export async function POST(req: Request) {
         .catch(() => {});
     }
 
+    let previousMessageIds: Set<string> | undefined;
+    try {
+      const previousMessages = await client.session.context({ sessionID: sessionId });
+      previousMessageIds = new Set(previousMessages.map((message) => message.id));
+    } catch {
+      // Keep the chat request working if usage history is unavailable.
+    }
+
     await client.session.prompt({
       sessionID: sessionId,
       text: body.system ? `${body.system}\n\n---\n\n${body.message}` : body.message,
@@ -69,7 +78,17 @@ export async function POST(req: Request) {
       250
     );
 
-    return NextResponse.json({ text, sessionId });
+    let usage;
+    if (previousMessageIds) {
+      try {
+        const messages = await client.session.context({ sessionID: sessionId });
+        usage = aggregateTokenUsage(messages, previousMessageIds);
+      } catch {
+        // Usage is optional; a context read failure must not fail a completed review.
+      }
+    }
+
+    return NextResponse.json({ text, sessionId, usage });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Chat request failed";
     return NextResponse.json({ error: message }, { status: 502 });

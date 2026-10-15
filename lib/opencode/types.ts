@@ -26,6 +26,17 @@ export interface ProviderInfo {
   models: ModelOption[];
 }
 
+/** Aggregated OpenCode token usage for one run. */
+export interface TokenUsage {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+  costUsd?: number;
+}
+
 /** A project (working directory) known to OpenCode. */
 export interface OpenCodeProject {
   id: string;
@@ -50,7 +61,38 @@ export interface ChatMessage {
 
 /** A neutral activity-log line streamed from a build session. */
 export interface ActivityEvent {
-  kind: "info" | "thought" | "tool_call" | "tool_result" | "error" | "done";
+  kind: "info" | "thought" | "tool_call" | "tool_result" | "error" | "done" | "halt";
   title: string;
   detail?: string;
+}
+
+/** A single field of a question form the agent may ask mid-build. */
+export interface HaltField {
+  key: string;
+  /** "string" | "number" | "integer" | "boolean" | "multiselect" | "external" … */
+  type: string;
+  title?: string;
+  description?: string;
+  required?: boolean;
+  options?: Array<{ value: string; label: string }>;
+}
+
+/**
+ * A point where the agent paused for a human decision:
+ * - `permission` — a tool wants to run and the ruleset says "ask".
+ * - `form` — the agent asked a question and is waiting for an answer.
+ *
+ * The build session stays busy until this is answered, so the stream must
+ * surface it (instead of waiting forever for a terminal event).
+ */
+export interface HaltRequest {
+  /** Permission request id, or form id. */
+  id: string;
+  kind: "permission" | "form";
+  title: string;
+  message?: string;
+  /** Permission resources (permission halts only). */
+  resources?: string[];
+  /** Form fields (form halts only). */
+  fields?: HaltField[];
 }
