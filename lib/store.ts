@@ -2,7 +2,8 @@
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import type { Project, Artifact, ArtifactStatus, Settings, StepId, ExecTask, TaskStatus, TaskPriority, Sprint, TaskBuild } from "./bmad/types";
+import type { Project, Artifact, ArtifactStatus, Settings, StepId, ExecTask, TaskStatus, TaskPriority, Sprint, TaskBuild, TaskImplementationReview } from "./bmad/types";
+import type { TokenUsage } from "./opencode/types";
 import { stepById } from "./bmad/roadmap";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -56,7 +57,9 @@ export interface StudioState {
     status: ArtifactStatus
   ) => void;
   addTask: (projectId: string, input: { title: string; detail?: string; epic?: string; tags?: string[]; priority?: TaskPriority; status?: TaskStatus }) => string;
-  updateTask: (projectId: string, taskId: string, patch: Partial<Pick<ExecTask, "title" | "detail" | "epic" | "tags" | "priority" | "builds" | "status">>) => void;
+  updateTask: (projectId: string, taskId: string, patch: Partial<Pick<ExecTask, "title" | "detail" | "epic" | "tags" | "priority" | "builds" | "implementationReview" | "status">>) => void;
+  archiveTask: (projectId: string, taskId: string) => void;
+  restoreTask: (projectId: string, taskId: string) => void;
   deleteTask: (projectId: string, taskId: string) => void;
   importTasks: (projectId: string, tasks: Array<{ title: string; detail?: string; epic?: string; tags?: string[]; priority?: TaskPriority }>) => number;
   createSprint: (projectId: string, input: { name: string; goal?: string; taskIds: string[] }) => string;
@@ -122,30 +125,75 @@ function normalizePriority(v: unknown): TaskPriority {
   return v === "high" || v === "low" ? v : "medium";
 }
 
+function normalizeTokenUsage(value: unknown): TokenUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const usage = value as Partial<TokenUsage>;
+  const number = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : 0;
+  const input = number(usage.input);
+  const output = number(usage.output);
+  const reasoning = number(usage.reasoning);
+  const cacheRead = number(usage.cacheRead);
+  const cacheWrite = number(usage.cacheWrite);
+  const total = typeof usage.total === "number" && Number.isFinite(usage.total)
+    ? usage.total
+    : input + output + reasoning + cacheRead + cacheWrite;
+  return {
+    input,
+    output,
+    reasoning,
+    cacheRead,
+    cacheWrite,
+    total,
+    costUsd: typeof usage.costUsd === "number" && Number.isFinite(usage.costUsd) ? usage.costUsd : undefined,
+  };
+}
+
 function normalizeBuilds(v: unknown): TaskBuild[] {
   if (!Array.isArray(v)) return [];
   return v
     .filter((b) => b && typeof (b as TaskBuild).startedAt === "string")
     .map((b) => {
       const x = b as TaskBuild;
-      const status = x.status === "done" || x.status === "error" || x.status === "stopped" ? x.status : "running" as const;
+      const status = x.status === "done" || x.status === "error" || x.status === "stopped" || x.status === "interrupted" ? x.status : "running" as const;
       return {
         id: String(x.id ?? taskUid()),
+        mode: x.mode === "review" ? "review" : "build",
         goal: String(x.goal ?? ""),
+        summary: typeof x.summary === "string" ? x.summary : undefined,
         status,
+        statusMessage: typeof x.statusMessage === "string" ? x.statusMessage : undefined,
+        model: typeof x.model === "string" ? x.model : undefined,
+        modelName: typeof x.modelName === "string" ? x.modelName : undefined,
+        agent: typeof x.agent === "string" ? x.agent : undefined,
+        sessionId: typeof x.sessionId === "string" ? x.sessionId : undefined,
+        usage: normalizeTokenUsage(x.usage),
         startedAt: String(x.startedAt),
         finishedAt: typeof x.finishedAt === "string" ? x.finishedAt : undefined,
         elapsedMs: typeof x.elapsedMs === "number" ? x.elapsedMs : undefined,
         eventCount: typeof x.eventCount === "number" ? x.eventCount : 0,
         files: Array.isArray(x.files) ? x.files.map((f) => String(f)).filter(Boolean).slice(0, 20) : [],
       };
-    })
-    .slice(0, 3);
+    });
 }
 
 function normalizeTags(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
   return [...new Set(v.map((t) => String(t).trim().replace(/^#/, "").toLowerCase()).filter(Boolean))].slice(0, 10);
+}
+
+function normalizeTaskReview(value: unknown): TaskImplementationReview | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const review = value as Partial<TaskImplementationReview>;
+  const validVerdicts: TaskImplementationReview["verdict"][] = ["implemented", "partial", "not_implemented", "unclear"];
+  if (!validVerdicts.includes(review.verdict as TaskImplementationReview["verdict"])) return undefined;
+  if (typeof review.summary !== "string" || typeof review.reviewedAt !== "string") return undefined;
+  return {
+    verdict: review.verdict as TaskImplementationReview["verdict"],
+    summary: review.summary,
+    reviewedAt: review.reviewedAt,
+    model: typeof review.model === "string" ? review.model : undefined,
+    agent: typeof review.agent === "string" ? review.agent : undefined,
+  };
 }
 
 function normalizeProjects(raw: unknown): Project[] {
@@ -158,7 +206,16 @@ function normalizeProjects(raw: unknown): Project[] {
       ...proj,
       directory: directory ?? "",
       sessionId: proj.sessionId,
-      tasks: rawTasks.map((t) => ({ ...t, tags: normalizeTags((t as ExecTask).tags), priority: normalizePriority((t as ExecTask).priority), builds: normalizeBuilds((t as ExecTask).builds), sessionId: (t as ExecTask).sessionId })),
+      tasks: rawTasks.map((t) => ({
+        ...t,
+        tags: normalizeTags((t as ExecTask).tags),
+        priority: normalizePriority((t as ExecTask).priority),
+        builds: normalizeBuilds((t as ExecTask).builds),
+        implementationReview: normalizeTaskReview((t as ExecTask).implementationReview),
+        sessionId: (t as ExecTask).sessionId,
+        archivedAt: typeof (t as ExecTask).archivedAt === "string" ? (t as ExecTask).archivedAt : undefined,
+        deletedAt: typeof (t as ExecTask).deletedAt === "string" ? (t as ExecTask).deletedAt : undefined,
+      })),
       sprints: rawSprints.map((s) => ({
         id: String((s as Sprint).id ?? taskUid()),
         name: String((s as Sprint).name ?? "Sprint"),
@@ -172,30 +229,56 @@ function normalizeProjects(raw: unknown): Project[] {
   });
 }
 
-async function pushProjects(projects: Project[]): Promise<void> {
-  try {
-    await fetch("/api/projects", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ projects }),
-    });
-  } catch {
-    // A failed push is retried on the next change (debounced subscriber below).
-  }
+async function pushProjects(projects: Project[], keepalive = false): Promise<void> {
+  const response = await fetch("/api/projects", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ projects }),
+    keepalive,
+  });
+  if (!response.ok) throw new Error(`Failed to save projects (HTTP ${response.status})`);
 }
 
 /** After the initial load, mirror every projects change to the server JSON file. */
 function ensureProjectsSync() {
   if (projectsSyncUnsub) return;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    void pushProjects(useStudio.getState().projects, true).catch((error: unknown) => {
+      console.error("Unable to flush project changes before page unload", error);
+    });
+  };
+  if (typeof window !== "undefined") window.addEventListener("pagehide", flush);
   projectsSyncUnsub = useStudio.subscribe((s, prev) => {
     if (!useStudio.getState().projectsLoaded) return;
     if (s.projects === prev.projects) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
-      void pushProjects(useStudio.getState().projects);
-    }, 800);
+      timer = undefined;
+      void pushProjects(useStudio.getState().projects).catch((error: unknown) => {
+        console.error("Unable to persist project changes", error);
+      });
+    }, 200);
   });
+}
+
+export function reconcileProjects(serverProjects: Project[], cachedProjects: Project[]) {
+  const cachedById = new Map(cachedProjects.map((project) => [project.id, project]));
+  let usedNewerCache = false;
+  const projects = serverProjects.map((serverProject) => {
+    const cachedProject = cachedById.get(serverProject.id);
+    if (!cachedProject) return serverProject;
+    const serverUpdatedAt = Date.parse(serverProject.updatedAt) || 0;
+    const cachedUpdatedAt = Date.parse(cachedProject.updatedAt) || 0;
+    if (cachedUpdatedAt > serverUpdatedAt) {
+      usedNewerCache = true;
+      return cachedProject;
+    }
+    return serverProject;
+  });
+  return { projects, usedNewerCache };
 }
 
 export const useStudio = create<StudioState>()(
@@ -370,14 +453,56 @@ export const useStudio = create<StudioState>()(
           ),
         })),
 
-      deleteTask: (projectId, taskId) =>
+      archiveTask: (projectId, taskId) => {
+        const now = new Date().toISOString();
         set((s) => ({
           projects: s.projects.map((p) =>
             p.id === projectId
-              ? { ...p, tasks: (p.tasks ?? []).filter((t) => t.id !== taskId), updatedAt: new Date().toISOString() }
+              ? {
+                  ...p,
+                  tasks: (p.tasks ?? []).map((t) =>
+                    t.id === taskId ? { ...t, archivedAt: now, updatedAt: now } : t
+                  ),
+                  updatedAt: now,
+                }
               : p
           ),
-        })),
+        }));
+      },
+
+      restoreTask: (projectId, taskId) => {
+        const now = new Date().toISOString();
+        set((s) => ({
+          projects: s.projects.map((p) =>
+            p.id === projectId
+              ? {
+                  ...p,
+                  tasks: (p.tasks ?? []).map((t) =>
+                    t.id === taskId ? { ...t, archivedAt: undefined, deletedAt: undefined, updatedAt: now } : t
+                  ),
+                  updatedAt: now,
+                }
+              : p
+          ),
+        }));
+      },
+
+      deleteTask: (projectId, taskId) => {
+        const now = new Date().toISOString();
+        set((s) => ({
+          projects: s.projects.map((p) =>
+            p.id === projectId
+              ? {
+                  ...p,
+                  tasks: (p.tasks ?? []).map((t) =>
+                    t.id === taskId ? { ...t, deletedAt: now, updatedAt: now } : t
+                  ),
+                  updatedAt: now,
+                }
+              : p
+          ),
+        }));
+      },
 
       importTasks: (projectId, tasks) => {
         const now = new Date().toISOString();
@@ -498,8 +623,10 @@ export const useStudio = create<StudioState>()(
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const json = (await res.json()) as { projects?: unknown; persisted?: boolean };
             if (json.persisted) {
-              // Server file is the source of truth — replace the local cache.
-              set({ projects: normalizeProjects(json.projects), projectsLoaded: true });
+              const serverProjects = normalizeProjects(json.projects);
+              const reconciled = reconcileProjects(serverProjects, get().projects);
+              set({ projects: reconciled.projects, projectsLoaded: true });
+              if (reconciled.usedNewerCache) await pushProjects(reconciled.projects);
             } else {
               // First run: migrate the localStorage cache to the server file.
               set({ projectsLoaded: true });

@@ -9,7 +9,9 @@ import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { useStudio } from "@/lib/store";
 import { ActivityLog } from "@/components/bmad/activity-log";
-import type { ActivityEvent } from "@/lib/opencode/types";
+import { HaltDialog, type HaltAnswer } from "@/components/bmad/halt-dialog";
+import type { ActivityEvent, HaltRequest } from "@/lib/opencode/types";
+import { opencode } from "@/lib/opencode/client";
 import type { Project, StepId } from "@/lib/bmad/types";
 import { stepById } from "@/lib/bmad/roadmap";
 
@@ -89,46 +91,6 @@ function BamadHaltDialog({ isOpen, onClose, onChoice, haltMessage, projectName, 
   );
 }
 
-// BMAD halt choices returned from OpenCode
-type BamadHaltChoice =
-  | "approve_continue"
-  | "approve_stop"
-  | "review_plan";
-
-interface BamadHaltDialogProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onChoice: (choice: BamadHaltChoice) => void;
-  haltMessage: string;
-  projectName: string;
-  projectDirectory: string;
-}
-
-function buildArtifactContext(project: Project): string {
-  const ids: StepId[] = ["prd", "ux", "architecture", "epics-stories", "sprint-planning"];
-  const parts: string[] = [];
-  for (const id of ids) {
-    const artifact = project.artifacts[id];
-    const name = stepById(id)?.name ?? id;
-    if (!artifact?.content?.trim()) {
-      // No artifact content — skip it; the agent will read from disk if needed.
-      parts.push(`### ${name}\n_(no content yet)_`);
-      continue;
-    }
-    // Instead of embedding full content in the prompt,
-    // we signal to the agent that artifacts exist in the project directory.
-    // The agent can read them from the project folder at {project.directory}.
-    // Only include a brief summary reference, not the full content,
-    // to keep the prompt lightweight.
-    const shortSummary = artifact.content.trim().length > 200
-      ? `${artifact.content.trim().slice(0, 200)}…(dipotong)`
-      : artifact.content.trim();
-    parts.push(`### ${name}\n${shortSummary}`);
-  }
-  if (parts.length === 0) return "";
-  return `Konteks rencana (dari tab Rencana, agen akan membaca dari folder project):\n${parts.join("\n\n")}\n\nCatatan: Agen OpenCode memiliki akses ke folder project di ${project.directory}. Artefak PRD, arsitektur, epic, dan sprint planning tersedia di dalam folder tersebut. Jika konten tidak muncul, periksa izin folder atau jalankan build ulang.\n---\n`;
-}
-
 // Drives a build turn on the project's OpenCode session via the SSE stream
 // endpoint. The session id is persisted on the project so guidance + build share
 // one conversation, in the same folder OpenCode uses.
@@ -145,6 +107,10 @@ export function BuildPanel({ project }: { project: Project }) {
   const [haltDialogOpen, setHaltDialogOpen] = useState(false);
   const [haltChoice, setHaltChoice] = useState<BamadHaltChoice | null>(null);
   const [haltMessage, setHaltMessage] = useState<string>("");
+  const [halt, setHalt] = useState<HaltRequest | null>(null);
+  const [answeringHalt, setAnsweringHalt] = useState(false);
+  const activeSessionRef = useRef<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const ready = Boolean(project.directory);
   const missingRequired = REQUIRED_FOR_BUILD.filter((id) => statusOf(project, id) !== "complete");
@@ -157,8 +123,8 @@ export function BuildPanel({ project }: { project: Project }) {
     const epics = project.artifacts["epics-stories"]?.content?.trim();
     const sprint = project.artifacts["sprint-planning"]?.content?.trim();
     bits.push(`Build ${project.name} sesuai artefak rencana.`);
-    if (prd) bits.push(`Ikuti PRD (ringkasan): ${prd.slice(0, 500)}${prd.length > 500 ? "…" : ""}`);
-    if (arch) bits.push(`Ikuti Architecture: ${arch.slice(0, 500)}${arch.length > 500 ? "…" : ""}`);
+    if (prd) bits.push(`Rujuk PRD di folder project.`);
+    if (arch) bits.push(`Rujuk Architecture di folder project.`);
     if (epics) bits.push(`Implementasikan epic/story prioritas pertama dari Epics & Stories.`);
     if (sprint) bits.push(`Patuhi sprint plan untuk urutan pengerjaan.`);
     bits.push(`Verifikasi dengan build/test dan laporkan file yang diubah.`);
@@ -171,11 +137,13 @@ export function BuildPanel({ project }: { project: Project }) {
     setError(null);
     setEvents([]);
     setLastDoneAt(null);
+    setHalt(null);
+    activeSessionRef.current = null;
 
     const controller = new AbortController();
     abortRef.current = controller;
     const goalSnapshot = goal.trim();
-    const prompt = `${buildArtifactContext(project)}Tujuan build:\n${goalSnapshot}`;
+    const prompt = `Tujuan build:\n${goalSnapshot}\n\nCatatan: Artefak rencana (PRD, Architecture, Epics, Sprint) tersedia di folder project. Baca dari disk sesuai kebutuhan.`;
 
     try {
       const res = await fetch("/api/opencode/stream", {
@@ -226,11 +194,16 @@ export function BuildPanel({ project }: { project: Project }) {
 
           if (eventName === "session") {
             const { sessionId } = payload as { sessionId?: string };
+            if (sessionId) activeSessionRef.current = sessionId;
             if (sessionId && sessionId !== project.sessionId) {
               setProjectSession(project.id, sessionId);
             }
           } else if (eventName === "log") {
             setEvents((prev) => [...prev, payload as ActivityEvent]);
+          } else if (eventName === "halt") {
+            setHalt(payload as HaltRequest);
+          } else if (eventName === "halt_resolved") {
+            setHalt(null);
           } else if (eventName === "done") {
             setLastDoneAt(new Date().toISOString());
             setLastGoal(goalSnapshot);
@@ -256,6 +229,8 @@ export function BuildPanel({ project }: { project: Project }) {
       }
     } finally {
       setBusy(false);
+      setHalt(null);
+      activeSessionRef.current = null;
       abortRef.current = null;
     }
   }
@@ -263,6 +238,28 @@ export function BuildPanel({ project }: { project: Project }) {
   function handleStop() {
     abortRef.current?.abort();
     setBusy(false);
+    setHalt(null);
+  }
+
+  async function handleHaltAnswer(answer: HaltAnswer) {
+    const current = halt;
+    const sessionId = activeSessionRef.current;
+    if (!current || !sessionId || answeringHalt) return;
+
+    setAnsweringHalt(true);
+    setError(null);
+    try {
+      if (answer.kind === "permission") {
+        await opencode.replyPermission({ sessionId, id: current.id, decision: answer.decision });
+      } else {
+        await opencode.replyForm({ sessionId, id: current.id, answer: answer.answer });
+      }
+      setHalt(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Gagal mengirim jawaban");
+    } finally {
+      setAnsweringHalt(false);
+    }
   }
 
   function handleHaltChoice(choice: BamadHaltChoice) {
@@ -474,6 +471,13 @@ export function BuildPanel({ project }: { project: Project }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <HaltDialog
+        halt={halt}
+        busy={answeringHalt}
+        onSubmit={handleHaltAnswer}
+        onClose={() => setHalt(null)}
+      />
     </div>
   );
 }

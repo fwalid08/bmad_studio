@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Rocket, Square, Loader2, ChevronLeft, ChevronRight, Pencil, Trash2, Wand2, FolderX, KanbanSquare, Sparkles, X, Check, ArrowRight, List, Search, CalendarDays } from "lucide-react";
+import { Plus, Rocket, Square, Loader2, ChevronLeft, ChevronRight, Pencil, Trash2, Wand2, FolderX, KanbanSquare, Sparkles, X, Check, ArrowRight, List, Search, CalendarDays, Maximize2, Minimize2, Archive, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -8,16 +8,24 @@ import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { useStudio } from "@/lib/store";
 import { ActivityLog } from "@/components/bmad/activity-log";
-import type { ActivityEvent } from "@/lib/opencode/types";
-import type { Project, ExecTask, TaskStatus, TaskPriority } from "@/lib/bmad/types";
+import { HaltDialog, type HaltAnswer } from "@/components/bmad/halt-dialog";
+import type { ActivityEvent, HaltRequest, TokenUsage } from "@/lib/opencode/types";
+import type { Project, ExecTask, TaskStatus, TaskPriority, TaskBuild, TaskImplementationReview } from "@/lib/bmad/types";
 import { stepById } from "@/lib/bmad/roadmap";
 import { agentForStep } from "@/lib/bmad/agents";
 import { opencode } from "@/lib/opencode/client";
+import { flattenModels } from "@/lib/opencode/client";
 import { directAI } from "@/lib/ai/client";
 import { suggestTasksFromArtifacts, parseMachineSprint, taskStats } from "@/lib/execution/tasks";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useNotifications } from "@/components/ui/notifications";
 
 const COLUMNS: Array<{ id: TaskStatus; name: string; hint: string }> = [
   { id: "backlog", name: "Backlog", hint: "Ide / story belum masuk sprint" },
@@ -51,12 +59,6 @@ const PRIORITY_LABEL: Record<string, string> = { high: "P1 · Duluan", medium: "
 
 function sortTasks<T extends { priority?: string; createdAt: string }>(list: T[]): T[] {
   return [...list].sort((a, b) => (PRIORITY_ORDER[a.priority ?? "medium"] ?? 1) - (PRIORITY_ORDER[b.priority ?? "medium"] ?? 1) || a.createdAt.localeCompare(b.createdAt));
-}
-
-function excerpt(text?: string, n = 400) {
-  const t = (text ?? "").trim();
-  if (!t) return "— belum ada —";
-  return t.length > n ? `${t.slice(0, n)}…` : t;
 }
 
 function parseTagInput(v: string): string[] {
@@ -148,6 +150,34 @@ function formatElapsed(ms?: number): string {
   return `${Math.floor(m / 60)} jam ${m % 60} mnt`;
 }
 
+function formatTokenCount(count: number): string {
+  return new Intl.NumberFormat("id-ID").format(count);
+}
+
+function formatUsd(amount: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 6,
+  }).format(amount);
+}
+
+function interruptionStatusMessage(reason?: string): string {
+  if (reason === "user") return "Run dihentikan oleh pengguna melalui OpenCode.";
+  if (reason === "shutdown") return "Run terhenti karena OpenCode server dimatikan.";
+  if (reason === "superseded") return "Run ini digantikan oleh run lain.";
+  if (reason === "inactivity") return "Run dihentikan karena batas waktu tidak aktif.";
+  return "Run dihentikan sebelum task selesai.";
+}
+
+function parseImplementationVerdict(text: string): TaskImplementationReview["verdict"] {
+  const value = text.match(/(?:^|\n)\s*VERDICT\s*:\s*(IMPLEMENTED|PARTIAL|NOT_IMPLEMENTED|UNCLEAR)\b/i)?.[1]?.toUpperCase();
+  if (value === "IMPLEMENTED") return "implemented";
+  if (value === "PARTIAL") return "partial";
+  if (value === "NOT_IMPLEMENTED") return "not_implemented";
+  return "unclear";
+}
+
 /** Ekstrak kandidat path file dari judul/detail event tool. */
 function extractFiles(events: ActivityEvent[]): string[] {
   const found: string[] = [];
@@ -202,20 +232,29 @@ function parseStories(text: string, fallbackEpic: string): Array<{ title: string
 }
 
 export function ExecutionPanel({ project }: { project: Project }) {
+  const notify = useNotifications();
   const settings = useStudio((s) => s.settings);
+  const updateSettings = useStudio((s) => s.updateSettings);
   const setProjectSession = useStudio((s) => s.setProjectSession);
+  const clearProjectSession = useStudio((s) => s.clearProjectSession);
   const setTaskSession = useStudio((s) => s.setTaskSession);
   const addTask = useStudio((s) => s.addTask);
   const updateTask = useStudio((s) => s.updateTask);
+  const archiveTask = useStudio((s) => s.archiveTask);
+  const restoreTask = useStudio((s) => s.restoreTask);
   const deleteTask = useStudio((s) => s.deleteTask);
   const importTasks = useStudio((s) => s.importTasks);
   const createSprint = useStudio((s) => s.createSprint);
   const closeSprint = useStudio((s) => s.closeSprint);
 
-  const tasks = useMemo(() => project.tasks ?? [], [project.tasks]);
-  const stats = taskStats(project.tasks);
+  const allTasks = useMemo(() => project.tasks ?? [], [project.tasks]);
+  const tasks = useMemo(() => allTasks.filter((t) => !t.archivedAt && !t.deletedAt), [allTasks]);
+  const archivedTasks = useMemo(() => allTasks.filter((t) => t.archivedAt && !t.deletedAt), [allTasks]);
+  const deletedTasks = useMemo(() => allTasks.filter((t) => t.deletedAt), [allTasks]);
+  const stats = taskStats(tasks);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selected = tasks.find((t) => t.id === selectedId) ?? null;
+  const selectedTaskDone = selected?.status === "done";
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<ExecTask | null>(null);
@@ -233,7 +272,8 @@ export function ExecutionPanel({ project }: { project: Project }) {
   const [listTag, setListTag] = useState<string | null>(null);
   const [listPri, setListPri] = useState<TaskPriority | null>(null);
   const [listStat, setListStat] = useState<TaskStatus | "all">("all");
-  const BOARD_LIMIT = 3;
+  const [listScope, setListScope] = useState<"active" | "archived" | "deleted">("active");
+  const BOARD_LIMIT = 15;
 
   // Perencana sprint: agen memilihkan task backlog → nama + tujuan sprint
   const [sprintOpen, setSprintOpen] = useState(false);
@@ -255,61 +295,125 @@ export function ExecutionPanel({ project }: { project: Project }) {
   const [elaborateError, setElaborateError] = useState<string | null>(null);
   const [elaborated, setElaborated] = useState<Array<{ title: string; detail: string; epic: string; checked: boolean }>>([]);
 
+  // Build dialog (form build + info task terpilih)
+  const [buildDialogOpen, setBuildDialogOpen] = useState(false);
+  const [buildFullscreen, setBuildFullscreen] = useState(false);
+  const [buildDetailsTab, setBuildDetailsTab] = useState<"history" | "activity" | "review">("history");
+  const [runMode, setRunMode] = useState<"build" | "review">("build");
+  const [activityMode, setActivityMode] = useState<"build" | "review">("build");
+
   // Build runner (per selected task, konteks artefak otomatis)
   const [goalOverride, setGoalOverride] = useState<string | null>(null);
+  const [models, setModels] = useState<ReturnType<typeof flattenModels>>([]);
   const [busy, setBusy] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(project.sessionId ?? null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const reviewAbortRef = useRef<AbortController | null>(null);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [lastDoneAt, setLastDoneAt] = useState<string | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+  // A pending human decision (tool permission or agent question) blocks the build.
+  const [halt, setHalt] = useState<HaltRequest | null>(null);
+  const [answeringHalt, setAnsweringHalt] = useState(false);
+  const activeSessionRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   // Log per task disimpan di memori sesi agar tidak hilang saat ganti seleksi;
   // ringkasannya (status, durasi, file) dipersist ke store saat build selesai.
   const logsRef = useRef(new Map<string, ActivityEvent[]>());
   const buildTaskRef = useRef<string | null>(null);
   const buildStartRef = useRef(0);
-  const buildStatusRef = useRef<"running" | "done" | "error" | "stopped">("running");
+  const buildStatusRef = useRef<"running" | "done" | "error" | "stopped" | "interrupted">("running");
+  const buildStatusMessageRef = useRef<string | undefined>(undefined);
   const buildCountRef = useRef(0);
   const buildGoalRef = useRef("");
   const ready = Boolean(project.directory);
+  const displayedSessionId = selected
+    ? selected.sessionId ?? currentSessionId
+    : currentSessionId ?? project.sessionId;
 
   function selectTask(id: string | null) {
+    if ((busy || reviewing) && id !== selectedId) return;
     if (selectedId) logsRef.current.set(selectedId, events);
     if (id === NO_TASK_KEY) id = null;
     setSelectedId(id);
     setGoalOverride(null);
     setEvents(id ? (logsRef.current.get(id) ?? []) : (logsRef.current.get(NO_TASK_KEY) ?? []));
+    if (!busy && !reviewing) {
+      const taskSessionId = id ? tasks.find((task) => task.id === id)?.sessionId ?? null : project.sessionId ?? null;
+      activeSessionRef.current = taskSessionId;
+      setCurrentSessionId(taskSessionId);
+    }
   }
 
   // Ticker elapsed time selama build berjalan.
   useEffect(() => {
     if (!busy) return;
-    setElapsedSec(0);
     const t = setInterval(() => setElapsedSec(Math.floor((Date.now() - buildStartRef.current) / 1000)), 1000);
     return () => clearInterval(t);
   }, [busy]);
 
-  const taskDefaultGoal = selected ? `${selected.title}${selected.detail ? `\n${selected.detail}` : ""}` : "";
-  const goalText = (goalOverride ?? taskDefaultGoal).trim();
-  const suggestions = useMemo(() => suggestTasksFromArtifacts(project), [project.artifacts]);
+  const goalText = (goalOverride ?? "").trim();
+  const buildModel = settings.defaultModel ?? "";
+  const latestBuild = selected?.builds?.[0];
+  const cumulativeBuildDurationMs = (selected?.builds ?? []).reduce(
+    (total, build) => total + (typeof build.elapsedMs === "number" ? build.elapsedMs : 0),
+    0
+  );
+  const cumulativeTokenUsage = (selected?.builds ?? []).reduce(
+    (total, build) => {
+      if (!build.usage) return total;
+      return {
+        input: total.input + build.usage.input,
+        output: total.output + build.usage.output,
+        reasoning: total.reasoning + build.usage.reasoning,
+        cacheRead: total.cacheRead + build.usage.cacheRead,
+        cacheWrite: total.cacheWrite + build.usage.cacheWrite,
+        total: total.total + build.usage.total,
+        runCount: total.runCount + 1,
+        costUsd: total.costUsd + (build.usage.costUsd ?? 0),
+        costRunCount: total.costRunCount + (build.usage.costUsd === undefined ? 0 : 1),
+      };
+    },
+    { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0, runCount: 0, costUsd: 0, costRunCount: 0 }
+  );
+  const canResumeBuild = latestBuild?.status === "error" || latestBuild?.status === "stopped" || latestBuild?.status === "interrupted";
+  const suggestions = useMemo(() => suggestTasksFromArtifacts(project), [project]);
+
+  useEffect(() => {
+    let active = true;
+    void opencode.providers()
+      .then(({ providers }) => {
+        if (active) setModels(flattenModels(providers));
+      })
+      .catch(() => {
+        if (active) setModels([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const allTags = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const t of tasks) for (const tag of t.tags ?? []) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    for (const t of allTasks) for (const tag of t.tags ?? []) counts.set(tag, (counts.get(tag) ?? 0) + 1);
     return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([tag]) => tag);
-  }, [tasks]);
+  }, [allTasks]);
   const visibleTasks = sortTasks(tagFilter ? tasks.filter((t) => (t.tags ?? []).includes(tagFilter)) : tasks);
   const nextUp = sortTasks(visibleTasks.filter((t) => t.status === "todo")).concat(sortTasks(visibleTasks.filter((t) => t.status === "backlog")))[0] ?? null;
 
-  function openList(status?: TaskStatus | "all") {
+  function openList(status?: TaskStatus | "all", scope: "active" | "archived" | "deleted" = "active") {
     if (status !== undefined) setListStat(status);
+    setListScope(scope);
     setListOpen(true);
   }
   const listFiltered = useMemo(() => {
     const q = listQ.trim().toLowerCase();
+    const scopedTasks = listScope === "active" ? tasks : listScope === "archived" ? archivedTasks : deletedTasks;
     return sortTasks(
-      tasks.filter((t) => {
+      scopedTasks.filter((t) => {
         if (listStat !== "all" && t.status !== listStat) return false;
         if (listPri && (t.priority ?? "medium") !== listPri) return false;
         if (listTag && !(t.tags ?? []).includes(listTag)) return false;
@@ -317,7 +421,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
         return true;
       })
     );
-  }, [tasks, listQ, listTag, listPri, listStat]);
+  }, [tasks, archivedTasks, deletedTasks, listScope, listQ, listTag, listPri, listStat]);
 
   function openNew() {
     setEditing(null);
@@ -339,6 +443,15 @@ export function ExecutionPanel({ project }: { project: Project }) {
     setFStatus(t.status);
     setDialogOpen(true);
   }
+
+  function openBuildDialog(t: ExecTask) {
+    if ((busy || reviewing) && t.id !== selectedId) return;
+    selectTask(t.id);
+    setGoalOverride(t.builds?.[0]?.goal || null);
+    setBuildDetailsTab(busy ? "activity" : reviewing ? "review" : "history");
+    setActivityMode("build");
+    setBuildDialogOpen(true);
+  }
   function saveDialog() {
     if (!fTitle.trim()) return;
     const tags = parseTagInput(fTags);
@@ -349,14 +462,15 @@ export function ExecutionPanel({ project }: { project: Project }) {
       selectTask(id);
     }
     setDialogOpen(false);
+    notify({ kind: "success", title: editing ? "Task diperbarui" : "Task dibuat", description: fTitle.trim() });
   }
 
   // Preview impor: centang kandidat, tandai duplikat sebelum masuk papan.
   const [importOpen, setImportOpen] = useState(false);
   const [importChecks, setImportChecks] = useState<boolean[]>([]);
   const existingTitles = useMemo(
-    () => new Set(tasks.map((t) => t.title.toLowerCase())),
-    [tasks]
+    () => new Set(allTasks.map((t) => t.title.toLowerCase())),
+    [allTasks]
   );
   const fromMachine = useMemo(
     () => suggestions.some((s) => (s as { fromMachine?: boolean }).fromMachine),
@@ -365,7 +479,9 @@ export function ExecutionPanel({ project }: { project: Project }) {
 
   function openImport() {
     if (suggestions.length === 0) {
-      setError("Belum ada artefak Epics/Stories untuk diimpor — isi dulu di tab Rencana.");
+      const message = "Belum ada artefak Epics/Stories untuk diimpor — isi dulu di tab Rencana.";
+      setError(message);
+      notify({ kind: "error", title: "Impor task tidak tersedia", description: message });
       return;
     }
     setError(null);
@@ -377,14 +493,37 @@ export function ExecutionPanel({ project }: { project: Project }) {
     const chosen = suggestions.filter((_, i) => importChecks[i]);
     const n = importTasks(project.id, chosen);
     setImportOpen(false);
-    if (n === 0) setError("Semua kandidat sudah ada di papan (duplikat).");
-    else setError(null);
+    if (n === 0) {
+      const message = "Semua kandidat sudah ada di papan (duplikat).";
+      setError(message);
+      notify({ kind: "error", title: "Impor task gagal", description: message });
+    } else {
+      setError(null);
+      notify({ kind: "success", title: "Task berhasil diimpor", description: `${n} task ditambahkan.` });
+    }
   }
 
   function move(t: ExecTask, dir: -1 | 1) {
     const idx = COLUMNS.findIndex((c) => c.id === t.status);
     const next = COLUMNS[idx + dir];
     if (next) updateTask(project.id, t.id, { status: next.id });
+  }
+
+  function handleArchiveTask(taskId: string) {
+    archiveTask(project.id, taskId);
+    if (selectedId === taskId) selectTask(null);
+    notify({ kind: "success", title: "Task diarsipkan" });
+  }
+
+  function handleDeleteTask(taskId: string) {
+    deleteTask(project.id, taskId);
+    if (selectedId === taskId) selectTask(null);
+    notify({ kind: "success", title: "Task dipindahkan ke sampah" });
+  }
+
+  function handleRestoreTask(taskId: string) {
+    restoreTask(project.id, taskId);
+    notify({ kind: "success", title: "Task dipulihkan" });
   }
 
   function openEpic() {
@@ -401,7 +540,9 @@ export function ExecutionPanel({ project }: { project: Project }) {
     const fresh = useStudio.getState().getProject(project.id) ?? project;
     const direct = settings.guidanceMode === "direct";
     if (!fresh.directory && !direct) {
-      setElaborateError("Set working directory dulu (atau pakai mode Direct AI di Settings) untuk memanggil agen.");
+      const message = "Set working directory dulu (atau pakai mode Direct AI di Settings) untuk memanggil agen.";
+      setElaborateError(message);
+      notify({ kind: "error", title: "Elaborasi epic tidak tersedia", description: message });
       return;
     }
     setElaborating(true);
@@ -445,8 +586,11 @@ export function ExecutionPanel({ project }: { project: Project }) {
       const parsed = parseStories(res.text, title);
       if (parsed.length === 0) throw new Error("Tidak bisa mem-parse hasil agen. Coba lagi dengan deskripsi lebih jelas.");
       setElaborated(parsed.map((s) => ({ ...s, checked: true })));
+      notify({ kind: "success", title: "Elaborasi epic selesai", description: `${parsed.length} story siap ditambahkan.` });
     } catch (e) {
-      setElaborateError(e instanceof Error ? e.message : "Elaborasi gagal");
+      const message = e instanceof Error ? e.message : "Elaborasi gagal";
+      setElaborateError(message);
+      notify({ kind: "error", title: "Elaborasi epic gagal", description: message });
     } finally {
       setElaborating(false);
     }
@@ -458,7 +602,13 @@ export function ExecutionPanel({ project }: { project: Project }) {
     const n = importTasks(project.id, chosen.map((s) => ({ title: s.title.trim(), detail: s.detail, epic: s.epic })));
     setEpicOpen(false);
     setElaborated([]);
-    if (n === 0) setError("Semua story sudah ada di papan (duplikat).");
+    if (n === 0) {
+      const message = "Semua story sudah ada di papan (duplikat).";
+      setError(message);
+      notify({ kind: "error", title: "Story tidak ditambahkan", description: message });
+    } else {
+      notify({ kind: "success", title: "Story berhasil ditambahkan", description: `${n} story ditambahkan ke papan.` });
+    }
   }
 
   function openSprintPlanner() {
@@ -497,7 +647,9 @@ export function ExecutionPanel({ project }: { project: Project }) {
     const fresh = useStudio.getState().getProject(project.id) ?? project;
     const backlog = sortTasks((fresh.tasks ?? []).filter((t) => t.status === "backlog"));
     if (backlog.length === 0) {
-      setSprintError("Backlog kosong — buat task atau impor dari artefak dulu.");
+      const message = "Backlog kosong — buat task atau impor dari artefak dulu.";
+      setSprintError(message);
+      notify({ kind: "error", title: "Saran sprint gagal", description: message });
       return;
     }
     // Saran sprint butuh jawaban terstruktur (JSON) — selalu via Direct AI,
@@ -548,13 +700,14 @@ export function ExecutionPanel({ project }: { project: Project }) {
       setSprintGoal(suggestion.goal);
       setSprintReason(`${suggestion.reason}${missed > 0 ? ` (${missed} usulan tidak cocok dan dilewati)` : ""}`.trim());
       setSprintPicks(matched as Array<{ id: string; title: string; checked: boolean }>);
+      notify({ kind: "success", title: "Saran sprint siap", description: `${matched.length} task dipilih.` });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Gagal meminta saran agen";
-      setSprintError(
-        /No Direct|Multiple Direct|provider|No model|API key|Unauthorized|401/i.test(msg)
-          ? `Direct AI belum siap (${msg}). Atur provider + API key + model di halaman Settings, lalu coba lagi.`
-          : msg
-      );
+      const message = /No Direct|Multiple Direct|provider|No model|API key|Unauthorized|401/i.test(msg)
+        ? `Direct AI belum siap (${msg}). Atur provider + API key + model di halaman Settings, lalu coba lagi.`
+        : msg;
+      setSprintError(message);
+      notify({ kind: "error", title: "Saran sprint gagal", description: message });
     } finally {
       setSprintAsking(false);
     }
@@ -565,41 +718,82 @@ export function ExecutionPanel({ project }: { project: Project }) {
     if (!sprintName.trim() || ids.length === 0) return;
     createSprint(project.id, { name: sprintName.trim(), goal: sprintGoal.trim(), taskIds: ids });
     setSprintOpen(false);
+    notify({ kind: "success", title: "Sprint dibuat", description: sprintName.trim() });
   }
 
-  async function handleBuild() {
-    if (!goalText || !ready || busy) return;
+  async function handleBuild(startedAtMs: number) {
+    if (selectedTaskDone || (!selected && !goalText) || !ready || busy || reviewing) return;
     const buildTaskId = selected?.id ?? null;
     const logKey = buildTaskId ?? NO_TASK_KEY;
-    const goalSnapshot = goalText;
+    const isResuming = latestBuild?.status === "error" || latestBuild?.status === "stopped" || latestBuild?.status === "interrupted";
+    setActivityMode("build");
+    const goalSnapshot = isResuming && latestBuild.goal ? latestBuild.goal : goalText;
+    const modelId = buildModel || settings.defaultModel;
+    const modelName = models.find((model) => model.id === modelId)?.name ?? modelId;
+    const effectiveSessionId = selected ? selected.sessionId : project.sessionId;
+    setBuildDetailsTab("activity");
+    setElapsedSec(0);
     setBusy(true);
     setError(null);
     setEvents([]);
     setLastDoneAt(null);
     logsRef.current.set(logKey, []);
     buildTaskRef.current = buildTaskId;
-    buildStartRef.current = Date.now();
+    buildStartRef.current = startedAtMs;
+    const buildId = `b_${buildStartRef.current.toString(36)}`;
     buildStatusRef.current = "running";
+    buildStatusMessageRef.current = undefined;
     buildCountRef.current = 0;
     buildGoalRef.current = goalSnapshot;
     const controller = new AbortController();
     abortRef.current = controller;
+    setHalt(null);
+    let buildSummary: string | undefined;
+    let buildUsage: TokenUsage | undefined;
+    let buildFailureMessage: string | undefined;
+    let activityErrorNotified = false;
     const pushLog = (e: ActivityEvent) => {
       const arr = [...(logsRef.current.get(logKey) ?? []), e];
       logsRef.current.set(logKey, arr);
       buildCountRef.current = arr.length;
       setEvents(arr);
+      if (e.kind === "error") {
+        activityErrorNotified = true;
+        notify({ kind: "error", title: e.title || "Aktivitas gagal", description: e.detail });
+      }
     };
     const taskLine = selected ? `Task: ${selected.title}${selected.epic ? ` (Epic: ${selected.epic})` : ""}\n${selected.detail ? `Detail: ${selected.detail}\n` : ""}` : "";
-    const prompt = `${artifactContext(project)}${taskLine}Tujuan build:\n${goalSnapshot}\n\nSetelah selesai, tandai file yang diubah dan cara verifikasi.`;
+    const prompt = isResuming
+      ? `${taskLine}Lanjutkan build dari kondisi terakhir setelah proses sebelumnya terputus. Periksa perubahan dan status kerja saat ini terlebih dahulu, jangan mengulang pekerjaan yang sudah selesai.${goalSnapshot ? `\n\nInstruksi tambahan tetap:\n${goalSnapshot}` : ""}`
+      : `${taskLine}${goalSnapshot ? `Instruksi tambahan:\n${goalSnapshot}\n\n` : ""}Catatan: Artefak rencana (PRD, Architecture, Epics, Sprint, Project Context) tersedia di folder project. Baca dari disk sesuai kebutuhan.\n\nSetelah selesai, tandai file yang diubah dan cara verifikasi.`;
     // Tandai task sedang dikerjakan begitu build mulai (backlog/todo -> in-progress).
     if (buildTaskId) {
       const cur = useStudio.getState().getProject(project.id)?.tasks?.find((t) => t.id === buildTaskId);
       if (cur && (cur.status === "backlog" || cur.status === "todo")) {
         updateTask(project.id, buildTaskId, { status: "in-progress" });
       }
+      if (cur) {
+        updateTask(project.id, buildTaskId, {
+          builds: [
+            {
+              id: buildId,
+              goal: goalSnapshot,
+              status: "running" as const,
+              model: modelId,
+              modelName,
+              agent: settings.buildAgent,
+              sessionId: effectiveSessionId,
+              startedAt: new Date(buildStartRef.current).toISOString(),
+              eventCount: 0,
+              files: [],
+            },
+            ...(cur.builds ?? []),
+          ],
+        });
+      }
     }
-    const effectiveSessionId = selected?.sessionId ?? project.sessionId;
+    activeSessionRef.current = effectiveSessionId ?? null;
+    setCurrentSessionId(effectiveSessionId ?? null);
     try {
       const res = await fetch("/api/opencode/stream", {
         method: "POST",
@@ -608,7 +802,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
           directory: project.directory,
           sessionId: effectiveSessionId,
           prompt,
-          model: settings.defaultModel,
+          model: modelId,
           agent: settings.buildAgent,
           title: `${project.name} — Build ${selected?.title ?? ""}`,
         }),
@@ -621,6 +815,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let sawDone = false;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -640,6 +835,8 @@ export function ExecutionPanel({ project }: { project: Project }) {
           if (eventName === "session") {
             const { sessionId } = payload as { sessionId?: string };
             if (sessionId) {
+              activeSessionRef.current = sessionId;
+              setCurrentSessionId(sessionId);
               if (buildTaskId && sessionId !== selected?.sessionId) {
                 setTaskSession(project.id, buildTaskId, sessionId);
               } else if (!buildTaskId && sessionId !== project.sessionId) {
@@ -648,25 +845,65 @@ export function ExecutionPanel({ project }: { project: Project }) {
             }
           } else if (eventName === "log") {
             pushLog(payload as ActivityEvent);
+          } else if (eventName === "halt") {
+            // Agent paused for a human decision; block the UI until answered.
+            setHalt(payload as HaltRequest);
+          } else if (eventName === "halt_resolved") {
+            setHalt(null);
           } else if (eventName === "done") {
-            if (buildStatusRef.current === "running") buildStatusRef.current = "done";
-            setLastDoneAt(new Date().toISOString());
+            sawDone = true;
+            const donePayload = payload as { summary?: unknown; usage?: TokenUsage };
+            buildSummary = typeof donePayload.summary === "string" ? donePayload.summary.trim() || undefined : undefined;
+            buildUsage = donePayload.usage;
+            if (buildStatusRef.current === "running") {
+              buildStatusRef.current = "done";
+              setLastDoneAt(new Date().toISOString());
+            }
           } else if (eventName === "error") {
             buildStatusRef.current = "error";
-            const { message } = payload as { message?: string };
-            setError(message ?? "Build error");
+            const { message, usage } = payload as { message?: string; usage?: TokenUsage };
+            buildFailureMessage = message ?? "Build error";
+            buildStatusMessageRef.current = buildFailureMessage;
+            buildUsage = usage;
+            setError(buildFailureMessage);
+          } else if (eventName === "interrupted") {
+            const { reason, usage } = payload as { reason?: string; usage?: TokenUsage };
+            buildStatusRef.current = "interrupted";
+            buildStatusMessageRef.current = interruptionStatusMessage(reason);
+            buildUsage = usage;
           }
         }
       }
-      setLastDoneAt((v) => v ?? new Date().toISOString());
+      if (!sawDone && !controller.signal.aborted && buildStatusRef.current === "running") {
+        buildStatusRef.current = "error";
+        buildFailureMessage = "Koneksi terputus sebelum build selesai. Build dapat dilanjutkan.";
+        buildStatusMessageRef.current = buildFailureMessage;
+        setError(buildFailureMessage);
+      } else if (sawDone) {
+        setLastDoneAt((v) => v ?? new Date().toISOString());
+      }
     } catch (e) {
       if ((e as Error)?.name !== "AbortError") {
         buildStatusRef.current = "error";
-        setError(e instanceof Error ? e.message : "Build failed");
+        buildFailureMessage = e instanceof Error ? e.message : "Build failed";
+        buildStatusMessageRef.current = buildFailureMessage;
+        setError(buildFailureMessage);
       }
     } finally {
       if (buildStatusRef.current === "running") {
         buildStatusRef.current = controller.signal.aborted ? "stopped" : "done";
+      }
+      if (buildStatusRef.current === "stopped" && !buildStatusMessageRef.current) {
+        buildStatusMessageRef.current = "Run dihentikan melalui tombol Stop.";
+      }
+      if (buildStatusRef.current === "done") {
+        notify({ kind: "success", title: "Build selesai", description: selected?.title });
+      } else if (buildStatusRef.current === "error" && !activityErrorNotified) {
+        notify({ kind: "error", title: "Build gagal", description: buildFailureMessage ?? "Build tidak berhasil." });
+      } else if (buildStatusRef.current === "stopped") {
+        notify({ kind: "info", title: "Build dihentikan", description: selected?.title });
+      } else if (buildStatusRef.current === "interrupted") {
+        notify({ kind: "info", title: "Build terinterupsi", description: buildStatusMessageRef.current });
       }
       const finishedAt = new Date().toISOString();
       const elapsedMs = Date.now() - buildStartRef.current;
@@ -676,17 +913,24 @@ export function ExecutionPanel({ project }: { project: Project }) {
         updateTask(project.id, buildTaskId, {
           builds: [
             {
-              id: `b_${Date.now().toString(36)}`,
+              id: buildId,
               goal: buildGoalRef.current,
+              summary: buildSummary,
               status: buildStatusRef.current,
+              model: modelId,
+              modelName,
+              agent: settings.buildAgent,
+              sessionId: activeSessionRef.current ?? effectiveSessionId ?? undefined,
+              usage: buildUsage,
+              statusMessage: buildStatusMessageRef.current,
               startedAt: new Date(buildStartRef.current).toISOString(),
               finishedAt,
               elapsedMs,
               eventCount: finalEvents.length,
               files: extractFiles(finalEvents),
             },
-            ...prev,
-          ].slice(0, 3),
+            ...prev.filter((build) => build.id !== buildId),
+          ],
         });
         // Build sukses -> task otomatis ke review agar siap dicek/QA.
         // Gagal / dihentikan -> status dibiarkan agar bisa diulang.
@@ -698,14 +942,188 @@ export function ExecutionPanel({ project }: { project: Project }) {
         }
       }
       setBusy(false);
+      setHalt(null);
       abortRef.current = null;
     }
   }
 
+  async function handleImplementationReview() {
+    if (!selected || selectedTaskDone || !ready || busy || reviewing) return;
+    const task = selected;
+    const reviewModel = buildModel || settings.defaultModel;
+    const controller = new AbortController();
+    const reviewStartedAt = new Date();
+    const reviewStartedAtMs = reviewStartedAt.getTime();
+    const sessionId = task.sessionId;
+    activeSessionRef.current = sessionId ?? null;
+    setCurrentSessionId(sessionId ?? null);
+    reviewAbortRef.current = controller;
+    setReviewing(true);
+    setReviewError(null);
+    setActivityMode("review");
+    setBuildDetailsTab("activity");
+    setEvents([
+      { kind: "info", title: `Review dimulai — ${task.title}`, detail: `Session: ${sessionId ?? "baru"}\nModel: ${reviewModel}` },
+      { kind: "thought", title: "Memeriksa implementasi dan bukti test", detail: "Membaca task, build terakhir, dan acceptance criteria tanpa mengubah file." },
+    ]);
+    try {
+      const message = [
+        "Review apakah task ini benar-benar sudah diimplementasikan pada repository saat ini.",
+        "Bersikap read-only: jangan mengubah file, jangan membuat commit, dan jangan menyatakan selesai hanya dari build summary.",
+        "Periksa implementasi dan test yang relevan. Cocokkan setiap acceptance criteria dengan bukti kode/test.",
+        "Gunakan verdict tepat satu ini pada baris pertama: VERDICT: IMPLEMENTED, VERDICT: PARTIAL, VERDICT: NOT_IMPLEMENTED, atau VERDICT: UNCLEAR.",
+        "Lalu tulis ulang summary review yang ringkas dengan bagian ## Summary, ## Evidence, dan ## Gaps. Sebutkan path file dan test konkret; jangan mengarang bukti.",
+        `Task: ${task.title}`,
+        `Epic: ${task.epic || "(tidak ada)"}`,
+        `Detail dan acceptance criteria:\n${task.detail || "(tidak ada)"}`,
+        `Build terakhir:\nStatus: ${task.builds?.[0]?.status ?? "belum ada"}\nInstruksi: ${task.builds?.[0]?.goal ?? "(tidak ada)"}\nSummary agen: ${task.builds?.[0]?.summary ?? "(tidak ada)"}\nFile tercatat: ${(task.builds?.[0]?.files ?? []).join(", ") || "(tidak ada)"}`,
+      ].join("\n\n");
+      const result = await opencode.chat({
+        directory: project.directory,
+        sessionId,
+        message,
+        model: reviewModel,
+        agent: "plan",
+        title: `Implementation review — ${task.title}`,
+        signal: controller.signal,
+      });
+      if (result.sessionId !== task.sessionId) setTaskSession(project.id, task.id, result.sessionId);
+      activeSessionRef.current = result.sessionId;
+      setCurrentSessionId(result.sessionId);
+      const review: TaskImplementationReview = {
+        verdict: parseImplementationVerdict(result.text),
+        summary: result.text.trim(),
+        reviewedAt: new Date().toISOString(),
+        model: reviewModel,
+        agent: "plan",
+      };
+      const reviewFinishedAt = new Date();
+      const reviewFinishedAtMs = reviewFinishedAt.getTime();
+      const reviewBuildEntry: TaskBuild = {
+        id: `rv_${reviewStartedAtMs.toString(36)}`,
+        mode: "review",
+        goal: `Review implementation — ${task.title}`,
+        summary: result.text.trim(),
+        status: "done",
+        model: reviewModel,
+        modelName: models.find((model) => model.id === reviewModel)?.name ?? reviewModel,
+        agent: "plan",
+        sessionId: result.sessionId,
+        usage: result.usage,
+        statusMessage: `Verdict review: ${review.verdict}`,
+        startedAt: reviewStartedAt.toISOString(),
+        finishedAt: reviewFinishedAt.toISOString(),
+        elapsedMs: reviewFinishedAtMs - reviewStartedAtMs,
+        eventCount: 2,
+        files: extractFiles(events),
+      };
+      updateTask(project.id, task.id, {
+        implementationReview: review,
+        builds: [reviewBuildEntry, ...(task.builds ?? [])],
+      });
+      setEvents((prev) => [
+        ...prev,
+        { kind: "done", title: `Review selesai · ${review.verdict}`, detail: review.summary },
+      ]);
+      notify({ kind: "success", title: `Review selesai: ${review.verdict}`, description: task.title });
+    } catch (reviewFailure) {
+      const aborted = reviewFailure instanceof Error && reviewFailure.name === "AbortError";
+      const message = aborted ? "Review dihentikan." : reviewFailure instanceof Error ? reviewFailure.message : "Review gagal dijalankan.";
+      setReviewError(message);
+      setEvents((prev) => [
+        ...prev,
+        { kind: "error", title: "Review gagal", detail: message },
+      ]);
+      const reviewFinishedAt = new Date();
+      const failedReviewBuild: TaskBuild = {
+        id: `rv_${reviewStartedAtMs.toString(36)}`,
+        mode: "review",
+        goal: `Review implementation — ${task.title}`,
+        summary: message,
+        status: aborted ? "stopped" : "error",
+        statusMessage: aborted ? "Review dihentikan melalui tombol Stop." : message,
+        model: reviewModel,
+        modelName: models.find((model) => model.id === reviewModel)?.name ?? reviewModel,
+        agent: "plan",
+        sessionId: task.sessionId,
+        startedAt: reviewStartedAt.toISOString(),
+        finishedAt: reviewFinishedAt.toISOString(),
+        elapsedMs: reviewFinishedAt.getTime() - reviewStartedAtMs,
+        eventCount: 2,
+        files: [],
+      };
+      updateTask(project.id, task.id, { builds: [failedReviewBuild, ...(task.builds ?? [])] });
+      notify({ kind: aborted ? "info" : "error", title: aborted ? "Review dihentikan" : "Review gagal", description: aborted ? task.title : message });
+    } finally {
+      if (reviewAbortRef.current === controller) reviewAbortRef.current = null;
+      setReviewing(false);
+    }
+  }
+
+  function handleStopReview() {
+    if (!reviewAbortRef.current) return;
+    reviewAbortRef.current.abort();
+    setReviewError("Review dihentikan.");
+    setReviewing(false);
+  }
+
+  async function handleDeleteSession() {
+    const sessionId = selected
+      ? selected.sessionId ?? (buildTaskRef.current === selected.id ? currentSessionId : null)
+      : currentSessionId ?? project.sessionId;
+    if (!sessionId || !project.directory) return;
+    try {
+      await opencode.deleteSession(project.directory, sessionId);
+      if (selected) setTaskSession(project.id, selected.id, undefined);
+      else clearProjectSession(project.id);
+      activeSessionRef.current = null;
+      setCurrentSessionId(null);
+      setError(null);
+      notify({ kind: "success", title: "Session OpenCode dihapus" });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Gagal menghapus session OpenCode.";
+      setError(message);
+      notify({ kind: "error", title: "Gagal menghapus session", description: message });
+    }
+  }
+
   function handleStop() {
-    if (buildStatusRef.current === "running") buildStatusRef.current = "stopped";
+    if (buildStatusRef.current === "running") {
+      buildStatusRef.current = "stopped";
+      buildStatusMessageRef.current = "Run dihentikan melalui tombol Stop.";
+    }
     abortRef.current?.abort();
     setBusy(false);
+    setHalt(null);
+  }
+
+  // Resolve a halt the agent paused on: approve/reject a tool permission or
+  // answer an agent question. The stream stays open and resumes on reply.
+  async function handleHaltAnswer(answer: HaltAnswer) {
+    const current = halt;
+    const sessionId = activeSessionRef.current;
+    if (!current || !sessionId || answeringHalt) return;
+    setAnsweringHalt(true);
+    setError(null);
+    try {
+      if (answer.kind === "permission") {
+        await opencode.replyPermission({
+          sessionId,
+          id: current.id,
+          decision: answer.decision,
+        });
+      } else {
+        await opencode.replyForm({ sessionId, id: current.id, answer: answer.answer });
+      }
+      setHalt(null);
+      notify({ kind: "success", title: "Jawaban dikirim ke agen" });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Gagal mengirim jawaban";
+      setError(message);
+      notify({ kind: "error", title: "Gagal mengirim jawaban", description: message });
+    } finally {
+      setAnsweringHalt(false);
+    }
   }
 
   return (
@@ -783,7 +1201,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
       <div className="flex flex-wrap items-center gap-2">
         <Button size="sm" onClick={openNew}><Plus className="size-4" /> Task baru</Button>
         <Button size="sm" variant="secondary" onClick={openEpic}><Sparkles className="size-4" /> Epic baru</Button>
-        <Button size="sm" variant="outline" onClick={() => openList("all")}><List className="size-4" /> Semua task ({tasks.length})</Button>
+        <Button size="sm" variant="outline" onClick={() => openList("all")}><List className="size-4" /> Semua task ({allTasks.length})</Button>
         <Button size="sm" variant="outline" onClick={openSprintPlanner}><CalendarDays className="size-4" /> Susun sprint</Button>
         <Button size="sm" variant="outline" onClick={openImport} disabled={suggestions.length === 0}>
           <Wand2 className="size-4" /> Impor {suggestions.length > 0 ? `${suggestions.length} ` : ""}dari artefak{fromMachine ? " · akurat" : " · tebakan"}
@@ -825,8 +1243,14 @@ export function ExecutionPanel({ project }: { project: Project }) {
                     key={t.id}
                     role="button"
                     tabIndex={0}
-                    onClick={() => selectTask(t.id)}
-                    onKeyDown={(e) => { if (e.key === "Enter") selectTask(t.id); }}
+                    onClick={() => openBuildDialog(t)}
+                    onKeyDown={(e) => {
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        openBuildDialog(t);
+                      }
+                    }}
                     className={`cursor-pointer rounded-lg border px-2 py-1.5 text-left transition-colors hover:bg-accent ${selectedId === t.id ? "border-primary/50 bg-accent" : "bg-card"}`}
                   >
                     <div className="flex items-center gap-1.5">
@@ -834,6 +1258,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
                       <button
                         type="button"
                         title="Klik untuk ganti prioritas"
+                        disabled={t.status === "done"}
                         onClick={(e) => {
                           e.stopPropagation();
                           const order: TaskPriority[] = ["high", "medium", "low"];
@@ -865,11 +1290,22 @@ export function ExecutionPanel({ project }: { project: Project }) {
                       </p>
                     )}
                     <div className="mt-1 flex items-center gap-0.5">
-                      <Button size="icon" variant="ghost" className="size-6" disabled={COLUMNS[0].id === t.status} onClick={(e) => { e.stopPropagation(); move(t, -1); }}><ChevronLeft className="size-3.5" /></Button>
-                      <Button size="icon" variant="ghost" className="size-6" disabled={COLUMNS[COLUMNS.length - 1].id === t.status} onClick={(e) => { e.stopPropagation(); move(t, 1); }}><ChevronRight className="size-3.5" /></Button>
+                      {t.status === "done" && (
+                        <Button size="sm" variant="outline" className="h-6 gap-1 px-2 text-[10px]" onClick={(e) => { e.stopPropagation(); updateTask(project.id, t.id, { status: "review" }); }}>
+                          <RotateCcw className="size-3" /> Buka kembali
+                        </Button>
+                      )}
                       <span className="flex-1" />
-                      <Button size="icon" variant="ghost" className="size-6" onClick={(e) => { e.stopPropagation(); openEdit(t); }}><Pencil className="size-3.5" /></Button>
-                      <Button size="icon" variant="ghost" className="size-6 text-destructive" onClick={(e) => { e.stopPropagation(); deleteTask(project.id, t.id); if (selectedId === t.id) selectTask(null); }}><Trash2 className="size-3.5" /></Button>
+                      <Button size="icon" variant="ghost" className="size-6" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); openEdit(t); }}><Pencil className="size-3.5" /></Button>
+                      <Button size="icon" variant="ghost" className="size-6" title="Arsipkan task" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); handleArchiveTask(t.id); }}><Archive className="size-3.5" /></Button>
+                      <Button size="icon" variant="ghost" className="size-6 text-destructive" title="Pindahkan ke sampah" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); handleDeleteTask(t.id); }}><Trash2 className="size-3.5" /></Button>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between rounded-md bg-muted/70 px-1.5 py-1">
+                      <span className="text-muted-foreground text-[10px]">Ganti status</span>
+                      <div className="flex items-center gap-1">
+                        <Button size="icon" variant="outline" className="size-6 bg-background" aria-label="Pindah ke status sebelumnya" title="Pindah ke status sebelumnya" disabled={t.status === "done" || COLUMNS[0].id === t.status} onClick={(e) => { e.stopPropagation(); move(t, -1); }}><ChevronLeft className="size-3.5" /></Button>
+                        <Button size="icon" variant="outline" className="size-6 bg-background" aria-label="Pindah ke status berikutnya" title="Pindah ke status berikutnya" disabled={t.status === "done" || COLUMNS[COLUMNS.length - 1].id === t.status} onClick={(e) => { e.stopPropagation(); move(t, 1); }}><ChevronRight className="size-3.5" /></Button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -884,188 +1320,60 @@ export function ExecutionPanel({ project }: { project: Project }) {
         })}
       </div>
 
-      {/* Detail task + build — tidak perlu bolak-balik ke Rencana */}
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Story / Task terpilih</CardTitle>
-            <CardDescription className="text-xs">Klik kartu di papan untuk melihat detail + konteks rencana di sini.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {!selected ? (
-              <p className="text-muted-foreground text-sm">Belum ada yang dipilih. Klik salah satu kartu, atau buat task baru.</p>
-            ) : (
-              <>
-                <div>
-                  <p className="text-sm font-bold">{selected.title}</p>
-                  <div className="mt-1 flex flex-wrap gap-1">
-                    {selected.epic && <Badge variant="secondary" className="text-[10px]">{selected.epic}</Badge>}
-                    {(selected.tags ?? []).map((tag) => (
-                      <Badge key={tag} variant="outline" className="text-[10px]">#{tag}</Badge>
-                    ))}
-                  </div>
-                  {selected.detail && <p className="text-muted-foreground mt-1 text-xs whitespace-pre-wrap">{selected.detail}</p>}
-                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                    <Button size="sm" variant="outline" onClick={() => openEdit(selected)}><Pencil className="size-3.5" /> Edit</Button>
-                    {selected.status !== "done" && (
-                      <Button size="sm" variant="ghost" onClick={() => updateTask(project.id, selected.id, { status: "done" })}>Tandai selesai</Button>
-                    )}
-                    <span className="mx-1 h-4 w-px bg-border" />
-                    {selected.sessionId ? (
-                      <>
-                        <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                          <span className="size-1.5 rounded-full bg-emerald-500" /> Session terisolasi
-                        </span>
-                        <Button size="sm" variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => setTaskSession(project.id, selected.id, undefined)}>
-                          Pakai session project
-                        </Button>
-                      </>
-                    ) : (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-7 px-2 text-[11px]"
-                        title="Buat chat session khusus untuk task ini — konteks tidak bercampur dengan task lain"
-                        onClick={() => {
-                          const id = `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-                          setTaskSession(project.id, selected.id, `task_session_${id}`);
-                        }}
-                      >
-                        <Plus className="size-3" /> Session terisolasi
-                      </Button>
-                    )}
-                  </div>
-                </div>
-                {(selected.builds ?? []).length > 0 && (
-                  <div className="space-y-1.5 rounded-md border bg-muted/40 p-2.5 text-xs">
-                    <p className="font-semibold">Riwayat build ({(selected.builds ?? []).length})</p>
-                    {(selected.builds ?? []).map((b) => (
-                      <div key={b.id} className="flex flex-col gap-1 rounded border bg-card p-2">
-                        <div className="flex items-center gap-1.5">
-                          <Badge variant={b.status === "done" ? "secondary" : b.status === "running" ? "default" : "outline"} className="text-[10px]">
-                            {b.status === "done" ? "Selesai" : b.status === "error" ? "Gagal" : b.status === "stopped" ? "Dihentikan" : "Berjalan"}
-                          </Badge>
-                          <span className="text-muted-foreground tabular-nums">
-                            {new Date(b.startedAt).toLocaleString()} · {formatElapsed(b.elapsedMs)} · {b.eventCount} event
-                          </span>
-                        </div>
-                        {b.files.length > 0 && (
-                          <div className="flex flex-wrap gap-1">
-                            {b.files.map((f) => (
-                              <code key={f} className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{f}</code>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <details className="rounded-md border bg-muted/40 p-2.5 text-xs" open>
-                  <summary className="cursor-pointer font-semibold">Konteks Rencana (tidak perlu buka tab Rencana)</summary>
-                  <div className="mt-2 space-y-2">
-                    <div><p className="font-semibold">PRD</p><p className="text-muted-foreground whitespace-pre-wrap">{excerpt(project.artifacts["prd"]?.content)}</p></div>
-                    <div><p className="font-semibold">Architecture</p><p className="text-muted-foreground whitespace-pre-wrap">{excerpt(project.artifacts["architecture"]?.content)}</p></div>
-                    <div><p className="font-semibold">Epics & Stories</p><p className="text-muted-foreground whitespace-pre-wrap">{excerpt(project.artifacts["epics-stories"]?.content)}</p></div>
-                  </div>
-                </details>
-              </>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-2 text-sm"><Rocket className="size-4" /> Build task</CardTitle>
-            <CardDescription className="text-xs">Agen mengerjakan task terpilih + konteks artefak otomatis di folder project.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {!ready && (
-              <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
-                <FolderX className="mt-0.5 size-4 shrink-0" /><p>Set working directory dulu di header project.</p>
-              </div>
-            )}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <Label htmlFor="exec-goal">Instruksi untuk agen (terisi dari task)</Label>
-                {goalOverride !== null && selected && (
-                  <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => setGoalOverride(null)} disabled={busy}>
-                    Ikuti task lagi
-                  </Button>
-                )}
-              </div>
-              <Textarea id="exec-goal" rows={5} value={goalOverride ?? taskDefaultGoal} onChange={(e) => setGoalOverride(e.target.value)} placeholder="Pilih task di papan, atau tulis instruksi manual…" disabled={busy} />
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {busy ? (
-                <Button variant="destructive" onClick={handleStop}><Square className="size-4" /> Stop</Button>
-              ) : (
-                <Button onClick={() => setConfirmOpen(true)} disabled={!goalText || !ready}><Rocket className="size-4" /> Jalankan build</Button>
-              )}
-              {busy && <span className="text-muted-foreground flex items-center gap-1.5 text-xs tabular-nums"><Loader2 className="size-3.5 animate-spin" /> Agen bekerja… {Math.floor(elapsedSec / 60)}:{String(elapsedSec % 60).padStart(2, "0")} · {events.length} event</span>}
-              {!busy && lastDoneAt && !error && <span className="text-xs text-emerald-600">Selesai {new Date(lastDoneAt).toLocaleTimeString()}</span>}
-            </div>
-            {error && <p className="text-destructive text-xs">{error}</p>}
-            {events.length > 0 && extractFiles(events).length > 0 && (
-              <div className="flex flex-wrap items-center gap-1">
-                <span className="text-muted-foreground text-[11px]">File tersentuh:</span>
-                {extractFiles(events).map((f) => (
-                  <code key={f} className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{f}</code>
-                ))}
-              </div>
-            )}
-            <ActivityLog events={events} />
-          </CardContent>
-        </Card>
-      </div>
+      {/* Build dialog — dibuka dari kartu task */}
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
+        <DialogContent className="flex max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-3xl flex-col overflow-hidden">
+          <DialogHeader className="shrink-0">
             <DialogTitle>{editing ? "Edit task" : "Task baru"}</DialogTitle>
             <DialogDescription>Task tersimpan di papan Eksekusi project ini.</DialogDescription>
           </DialogHeader>
-          <div className="space-y-3">
-            <div className="space-y-1.5">
-              <Label>Judul</Label>
-              <Input value={fTitle} onChange={(e) => setFTitle(e.target.value)} placeholder="cth. Story 1.2 — User bisa membuat task" />
-            </div>
-            <div className="space-y-1.5">
-              <Label>Epic (opsional)</Label>
-              <Input value={fEpic} onChange={(e) => setFEpic(e.target.value)} placeholder="cth. Epic 1 — Onboarding" />
-            </div>
-            <div className="space-y-1.5">
-              <Label>Tag (pisahkan koma, tanpa #)</Label>
-              <Input value={fTags} onChange={(e) => setFTags(e.target.value)} placeholder="cth. frontend, urgent, bug" />
-              {parseTagInput(fTags).length > 0 && (
-                <div className="flex flex-wrap gap-1">
-                  {parseTagInput(fTags).map((tag) => (
-                    <Badge key={tag} variant="outline" className="text-[10px]">#{tag}</Badge>
-                  ))}
-                </div>
-              )}
-            </div>
-            <div className="space-y-1.5">
-              <Label>Detail / acceptance criteria</Label>
-              <Textarea value={fDetail} onChange={(e) => setFDetail(e.target.value)} rows={4} placeholder="AC1: …&#10;AC2: …" />
-            </div>
-            <div className="space-y-1.5">
-              <Label>Prioritas (menentukan urutan)</Label>
-              <div className="flex flex-wrap gap-1.5">
-                {(["high", "medium", "low"] as TaskPriority[]).map((p) => (
-                  <Button key={p} size="sm" variant={fPriority === p ? "secondary" : "outline"} onClick={() => setFPriority(p)}>{PRIORITY_LABEL[p]}</Button>
-                ))}
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>Judul</Label>
+                <Input value={fTitle} onChange={(e) => setFTitle(e.target.value)} placeholder="cth. Story 1.2 — User bisa membuat task" />
               </div>
-            </div>
-            <div className="space-y-1.5">
-              <Label>Status</Label>
-              <div className="flex flex-wrap gap-1.5">
-                {COLUMNS.map((c) => (
-                  <Button key={c.id} size="sm" variant={fStatus === c.id ? "secondary" : "outline"} onClick={() => setFStatus(c.id)}>{c.name}</Button>
-                ))}
+              <div className="space-y-1.5">
+                <Label>Epic</Label>
+                <Input value={fEpic} onChange={(e) => setFEpic(e.target.value)} placeholder="Opsional" />
+              </div>
+              <div className="space-y-1.5 sm:col-span-2">
+                <Label>Detail / acceptance criteria</Label>
+                <Textarea value={fDetail} onChange={(e) => setFDetail(e.target.value)} rows={4} placeholder="AC1: …&#10;AC2: …" />
+              </div>
+              <div className="space-y-1.5 sm:col-span-2">
+                <Label>Tag</Label>
+                <Input value={fTags} onChange={(e) => setFTags(e.target.value)} placeholder="Pisahkan dengan koma" />
+                {parseTagInput(fTags).length > 0 && (
+                  <div className="flex flex-wrap gap-1">
+                    {parseTagInput(fTags).map((tag) => <Badge key={tag} variant="outline" className="text-[10px]">#{tag}</Badge>)}
+                  </div>
+                )}
+              </div>
+              <div className="space-y-1.5">
+                <Label>Prioritas</Label>
+                <Select value={fPriority} onValueChange={(value) => setFPriority(value as TaskPriority)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {(["high", "medium", "low"] as TaskPriority[]).map((priority) => (
+                      <SelectItem key={priority} value={priority}>{PRIORITY_LABEL[priority]}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label>Status</Label>
+                <Select value={fStatus} onValueChange={(value) => setFStatus(value as TaskStatus)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {COLUMNS.map((column) => <SelectItem key={column.id} value={column.id}>{column.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
           </div>
-          <DialogFooter>
+          <DialogFooter className="shrink-0">
             <Button variant="ghost" onClick={() => setDialogOpen(false)}>Batal</Button>
             <Button onClick={saveDialog} disabled={!fTitle.trim()}>Simpan</Button>
           </DialogFooter>
@@ -1135,16 +1443,22 @@ export function ExecutionPanel({ project }: { project: Project }) {
         </DialogContent>
       </Dialog>
 
+
       <Dialog open={listOpen} onOpenChange={setListOpen}>
-        <DialogContent className="flex max-h-[85vh] max-w-3xl flex-col overflow-hidden">
+        <DialogContent className="flex h-[85vh] max-w-[92vw] flex-col overflow-hidden xl:max-w-7xl">
           <DialogHeader className="shrink-0">
-            <DialogTitle>Daftar task ({listFiltered.length}/{tasks.length})</DialogTitle>
+            <DialogTitle>Daftar task ({listFiltered.length}/{listScope === "active" ? tasks.length : listScope === "archived" ? archivedTasks.length : deletedTasks.length})</DialogTitle>
             <DialogDescription>Klik baris untuk memilih task dan menutup dialog.</DialogDescription>
           </DialogHeader>
           <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto pr-1">
             <div className="relative">
               <Search className="text-muted-foreground absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2" />
               <Input value={listQ} onChange={(e) => setListQ(e.target.value)} placeholder="Cari judul, detail, epic…" className="pl-8" />
+            </div>
+            <div role="group" aria-label="Filter task" className="grid grid-cols-3 gap-1">
+              <Button size="sm" variant={listScope === "active" ? "secondary" : "outline"} aria-pressed={listScope === "active"} onClick={() => { setListScope("active"); setListStat("all"); setListPri(null); setListTag(null); }}>Aktif ({tasks.length})</Button>
+              <Button size="sm" variant={listScope === "archived" ? "secondary" : "outline"} aria-pressed={listScope === "archived"} onClick={() => { setListScope("archived"); setListStat("all"); setListPri(null); setListTag(null); }}>Arsip ({archivedTasks.length})</Button>
+              <Button size="sm" variant={listScope === "deleted" ? "secondary" : "outline"} aria-pressed={listScope === "deleted"} onClick={() => { setListScope("deleted"); setListStat("all"); setListPri(null); setListTag(null); }}>Sampah ({deletedTasks.length})</Button>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
               <Button size="sm" variant={listStat === "all" ? "secondary" : "ghost"} className="h-6 px-2 text-[11px]" onClick={() => setListStat("all")}>Semua status</Button>
@@ -1166,31 +1480,65 @@ export function ExecutionPanel({ project }: { project: Project }) {
                 ))}
               </div>
             )}
-            <ul className="space-y-1">
+            <div className="grid grid-cols-2 gap-2 min-h-0 lg:grid-cols-3">
               {listFiltered.length === 0 && (
-                <li className="text-muted-foreground rounded-md border border-dashed p-4 text-center text-xs">Tidak ada task yang cocok.</li>
+                <p className="text-muted-foreground col-span-2 rounded-md border border-dashed p-4 text-center text-xs">Tidak ada task yang cocok.</p>
               )}
               {listFiltered.map((t) => (
-                <li key={t.id}>
-                  <button
-                    type="button"
-                    onClick={() => { selectTask(t.id); setListOpen(false); }}
-                    className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-left transition-colors hover:bg-accent ${selectedId === t.id ? "border-primary/50 bg-accent" : ""}`}
+                <div key={t.id} className={`rounded-md border bg-card p-3 flex flex-col gap-2 ${selectedId === t.id ? "border-primary/50" : ""}`}>
+                  <div
+                    role={listScope === "active" ? "button" : undefined}
+                    tabIndex={listScope === "active" ? 0 : undefined}
+                    onClick={listScope === "active" ? () => { selectTask(t.id); setListOpen(false); } : undefined}
+                    onKeyDown={listScope === "active" ? (event) => { if (event.key === "Enter") { selectTask(t.id); setListOpen(false); } } : undefined}
+                    className={`flex items-start gap-2 text-left ${listScope === "active" ? "cursor-pointer" : ""}`}
                   >
                     <span className={`shrink-0 rounded px-1 py-0.5 text-[10px] font-bold ${(t.priority ?? "medium") === "high" ? "bg-red-500/15 text-red-600 dark:text-red-400" : (t.priority ?? "medium") === "low" ? "bg-muted text-muted-foreground" : "bg-amber-500/15 text-amber-700 dark:text-amber-400"}`}>
                       {PRIORITY_LABEL[t.priority ?? "medium"]}
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-xs font-medium">{t.title}</span>
-                      <span className="text-muted-foreground block truncate text-[11px]">
+                      <span className="text-muted-foreground block truncate text-[10px]">
                         {COLUMNS.find((c) => c.id === t.status)?.name}{t.epic ? ` · ${t.epic}` : ""}{(t.tags ?? []).length > 0 ? ` · ${(t.tags ?? []).map((g) => `#${g}`).join(" ")}` : ""}
                       </span>
                     </span>
-                    <ChevronRight className="text-muted-foreground size-3.5 shrink-0" />
-                  </button>
-                </li>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {listScope === "active" && (
+                      <>
+                        <Button size="sm" variant="secondary" className="h-6 gap-1 px-2 text-[10px]" disabled={t.status === "done"} onClick={() => { setListOpen(false); openBuildDialog(t); }}>
+                          <Rocket className="size-3" /> Build
+                        </Button>
+                        <Button size="sm" variant="outline" className="h-6 gap-1 px-2 text-[10px]" disabled={t.status === "done"} onClick={() => { setListOpen(false); openEdit(t); }}>
+                          <Pencil className="size-3" /> Edit
+                        </Button>
+                        <Button size="sm" variant="ghost" className="h-6 gap-1 px-2 text-[10px]" disabled={t.status === "done"} onClick={() => handleArchiveTask(t.id)}>
+                          <Archive className="size-3" /> Arsip
+                        </Button>
+                        <Button size="sm" variant="ghost" className="h-6 gap-1 px-2 text-[10px] text-destructive" disabled={t.status === "done"} onClick={() => handleDeleteTask(t.id)}>
+                          <Trash2 className="size-3" /> Ke sampah
+                        </Button>
+                      </>
+                    )}
+                    {listScope === "archived" && (
+                      <>
+                        <Button size="sm" variant="secondary" className="h-6 gap-1 px-2 text-[10px]" disabled={t.status === "done"} onClick={() => handleRestoreTask(t.id)}>
+                          <RotateCcw className="size-3" /> Pulihkan
+                        </Button>
+                        <Button size="sm" variant="ghost" className="h-6 gap-1 px-2 text-[10px] text-destructive" disabled={t.status === "done"} onClick={() => handleDeleteTask(t.id)}>
+                          <Trash2 className="size-3" /> Ke sampah
+                        </Button>
+                      </>
+                    )}
+                    {listScope === "deleted" && (
+                      <Button size="sm" variant="secondary" className="h-6 gap-1 px-2 text-[10px]" disabled={t.status === "done"} onClick={() => handleRestoreTask(t.id)}>
+                        <RotateCcw className="size-3" /> Pulihkan
+                      </Button>
+                    )}
+                  </div>
+                </div>
               ))}
-            </ul>
+            </div>
           </div>
           <DialogFooter className="shrink-0">
             <Button variant="ghost" onClick={() => setListOpen(false)}>Tutup</Button>
@@ -1305,7 +1653,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Jalankan build?</DialogTitle>
+            <DialogTitle>{canResumeBuild ? "Lanjutkan build?" : "Jalankan build?"}</DialogTitle>
             <DialogDescription>
               Agen akan mengerjakan dan mengubah file di folder project. Pastikan instruksi sudah benar.
             </DialogDescription>
@@ -1316,17 +1664,375 @@ export function ExecutionPanel({ project }: { project: Project }) {
             )}
             <p className="text-muted-foreground">Folder:</p>
             <code className="block max-w-full truncate rounded bg-muted px-2 py-1 font-mono text-[11px]" title={project.directory}>{project.directory || "belum di-set"}</code>
-            <p className="text-muted-foreground">Instruksi:</p>
-            <pre className="max-h-40 overflow-auto rounded border bg-muted/40 p-2 text-xs whitespace-pre-wrap">{goalText || "— kosong —"}</pre>
+            <p className="text-muted-foreground">Instruksi tambahan:</p>
+            <pre className="max-h-40 overflow-auto rounded border bg-muted/40 p-2 text-xs whitespace-pre-wrap">{goalText || "Tidak ada instruksi tambahan."}</pre>
           </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setConfirmOpen(false)}>Batal</Button>
-            <Button onClick={() => { setConfirmOpen(false); void handleBuild(); }} disabled={!goalText || !ready}>
-              <Rocket className="size-4" /> Jalankan
+            <Button onClick={(event) => { setConfirmOpen(false); void handleBuild(performance.timeOrigin + event.timeStamp); }} disabled={selectedTaskDone || (!selected && !goalText) || !ready}>
+              <Rocket className="size-4" /> {canResumeBuild ? "Lanjutkan" : "Jalankan"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Build Dialog — form build + info task terpilih */}
+      <Dialog
+        open={buildDialogOpen}
+        onOpenChange={(open) => {
+          setBuildDialogOpen(open);
+          if (!open) setBuildFullscreen(false);
+        }}
+      >
+        <DialogContent
+          className={`flex flex-col gap-4 overflow-hidden ${buildFullscreen ? "h-dvh w-screen !max-w-none rounded-none" : "h-[90dvh] w-[96vw] !max-w-[1200px]"}`}
+        >
+          <DialogHeader className="shrink-0 pr-8">
+            <div className="flex items-center justify-between gap-2">
+              <DialogTitle className="flex items-center gap-2"><Rocket className="size-4" /> Build task</DialogTitle>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="size-7"
+                onClick={() => setBuildFullscreen(!buildFullscreen)}
+                title={buildFullscreen ? "Kecilkan" : "Perbesar full page"}
+              >
+                {buildFullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+              </Button>
+            </div>
+            <DialogDescription>
+              Agen mengerjakan task terpilih + konteks artefak otomatis di folder project.
+            </DialogDescription>
+          </DialogHeader>
+          {selected && (
+            <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+              <div className="shrink-0 rounded-md border bg-muted/30 p-3">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0 space-y-1.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-semibold">{selected.title}</p>
+                      <Badge variant="secondary" className="text-[10px]">{PRIORITY_LABEL[selected.priority ?? "medium"]}</Badge>
+                    </div>
+                    {selected.epic && <p className="text-muted-foreground text-xs">Epic: {selected.epic}</p>}
+                    {(selected.tags ?? []).length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {(selected.tags ?? []).map((tag) => (
+                          <Badge key={tag} variant="outline" className="text-[10px]">#{tag}</Badge>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1 sm:justify-end sm:self-center">
+                    <Button size="sm" variant="outline" className="h-7 px-2" disabled={selectedTaskDone || busy || reviewing} onClick={() => { setBuildDialogOpen(false); openEdit(selected); }}>
+                      <Pencil className="size-3" /> Edit task
+                    </Button>
+                    {selected.status !== "done" && (
+                      <Button size="sm" className="h-7 bg-emerald-600 px-2 text-white hover:bg-emerald-700 dark:bg-emerald-500 dark:text-emerald-950 dark:hover:bg-emerald-400" disabled={busy || reviewing} onClick={() => updateTask(project.id, selected.id, { status: "done" })}>
+                        <Check className="size-3" /> Selesai
+                      </Button>
+                    )}
+                    {selected.status === "done" && (
+                      <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => updateTask(project.id, selected.id, { status: "review" })}>
+                        <RotateCcw className="size-3" /> Buka kembali
+                      </Button>
+                    )}
+                    {displayedSessionId && (
+                      <Button size="sm" variant="outline" className="h-7 px-2" disabled={selectedTaskDone || busy || reviewing} onClick={() => void handleDeleteSession()}>
+                        <Trash2 className="size-3" /> Hapus session
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3 overflow-hidden lg:grid-cols-[2fr_3fr] lg:grid-rows-1">
+                <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto rounded-md border bg-card p-3 shadow-sm lg:col-span-1">
+                {/* Form build */}
+                <div className="flex min-h-0 flex-1 flex-col gap-2.5">
+                  {!ready && (
+                    <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
+                      <FolderX className="mt-0.5 size-4 shrink-0" /><p>Set working directory dulu di header project.</p>
+                    </div>
+                  )}
+                  <div className="space-y-1.5">
+                    <Label>Mode</Label>
+                    <div className="grid grid-cols-2 rounded-md border p-1" role="group" aria-label="Mode eksekusi">
+                      <Button type="button" size="sm" variant="ghost" className={runMode === "build" ? "bg-emerald-600 text-white hover:bg-emerald-700 hover:text-white" : ""} aria-pressed={runMode === "build"} onClick={() => setRunMode("build")} disabled={selectedTaskDone || busy || reviewing}>
+                        <Rocket className="size-3.5" /> Build
+                      </Button>
+                      <Button type="button" size="sm" variant="ghost" className={runMode === "review" ? "bg-sky-600 text-white hover:bg-sky-700 hover:text-white" : ""} aria-pressed={runMode === "review"} onClick={() => setRunMode("review")} disabled={selectedTaskDone || busy || reviewing}>
+                        <Search className="size-3.5" /> Review
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Model</Label>
+                    {!busy && (
+                      <Select value={buildModel} disabled={selectedTaskDone || reviewing} onValueChange={(modelId) => updateSettings({ defaultModel: modelId })}>
+                        <SelectTrigger className="w-full min-w-0" aria-label="Model untuk build">
+                          <SelectValue placeholder="Pilih model" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {buildModel && !models.some((model) => model.id === buildModel) && (
+                            <SelectItem value={buildModel}>{buildModel}</SelectItem>
+                          )}
+                          {models.map((model) => (
+                            <SelectItem key={model.id} value={model.id}>
+                              {model.name} — {model.id}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <Label htmlFor="exec-goal">Instruksi tambahan</Label>
+                      {goalOverride !== null && selected && (
+                        <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => setGoalOverride(null)} disabled={selectedTaskDone || busy || reviewing}>
+                          Kosongkan
+                        </Button>
+                      )}
+                    </div>
+                    <Textarea id="exec-goal" rows={7} className="min-h-40 resize-y" value={goalOverride ?? ""} onChange={(e) => setGoalOverride(e.target.value)} placeholder="Opsional. Tambahkan konteks atau batasan khusus untuk agen…" disabled={selectedTaskDone || busy || reviewing} />
+                  </div>
+                  <div className="grid grid-cols-1 items-center gap-2 sm:grid-cols-2">
+                    {busy ? (
+                      <div className="flex min-w-0 items-center gap-2 sm:col-span-2">
+                        <Button variant="destructive" className="shrink-0" onClick={handleStop}><Square className="size-4" /> Stop</Button>
+                        <span
+                          className="text-muted-foreground flex min-w-0 flex-1 items-center gap-1.5 truncate text-xs tabular-nums"
+                          title={`Agen bekerja… ${Math.floor(elapsedSec / 60)}:${String(elapsedSec % 60).padStart(2, "0")} · ${events.length} event`}
+                        >
+                          <Loader2 className="size-3.5 shrink-0 animate-spin" />
+                          <span className="truncate">Agen bekerja… {Math.floor(elapsedSec / 60)}:{String(elapsedSec % 60).padStart(2, "0")} · {events.length} event</span>
+                        </span>
+                      </div>
+                    ) : reviewing ? (
+                      <Button variant="destructive" className="w-full sm:col-span-2" onClick={handleStopReview}>
+                        <Square className="size-4" /> Stop review
+                      </Button>
+                    ) : (
+                      <Button className="w-full sm:col-span-2" onClick={() => runMode === "review" ? void handleImplementationReview() : setConfirmOpen(true)} disabled={selectedTaskDone || (!selected && (runMode === "review" || !goalText)) || !ready}>
+                        {runMode === "review" ? <Search className="size-4" /> : <Rocket className="size-4" />}
+                        {runMode === "review" ? "Jalankan review" : canResumeBuild ? "Lanjutkan build" : "Jalankan build"}
+                      </Button>
+                    )}
+                    {!busy && lastDoneAt && !error && <span className="text-xs text-emerald-600 sm:col-span-2">Selesai {new Date(lastDoneAt).toLocaleTimeString()}</span>}
+                  </div>
+                  {error && <p className="text-destructive text-xs">{error}</p>}
+                  {events.length > 0 && extractFiles(events).length > 0 && (
+                    <div className="flex min-h-0 flex-1 flex-col gap-1">
+                      <p className="text-muted-foreground text-[11px]">File tersentuh · {extractFiles(events).length}</p>
+                      <ul className="min-h-0 flex-1 list-inside list-disc space-y-1 overflow-y-auto pl-1 marker:text-muted-foreground">
+                        {extractFiles(events).map((file) => <li key={file} className="min-w-0"><code className="break-all font-mono text-[10px]">{file}</code></li>)}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+                </div>
+                <div className="flex min-h-0 min-w-0 flex-col gap-1.5 overflow-hidden rounded-md border bg-card p-3 shadow-sm lg:col-span-1">
+                  <Tabs value={buildDetailsTab} onValueChange={(value) => setBuildDetailsTab(value as "history" | "activity" | "review")} className="flex min-h-0 flex-1 flex-col">
+                    <TabsList className="grid w-full shrink-0 grid-cols-3">
+                      <TabsTrigger value="history" disabled={busy || reviewing}>Riwayat build ({(selected.builds ?? []).length})</TabsTrigger>
+                      <TabsTrigger value="review" disabled={busy}>Review</TabsTrigger>
+                      <TabsTrigger value="activity">Aktivitas</TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="activity" className="mt-2 flex min-h-0 flex-1 flex-col gap-2">
+                      <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-2.5 py-1.5">
+                        <div className="min-w-0">
+                          <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Session</p>
+                          <p className="truncate font-mono text-[11px] tabular-nums">{displayedSessionId ?? "Belum ada session"}</p>
+                        </div>
+                        {displayedSessionId && (
+                          <Button size="sm" variant="ghost" className="h-7 px-2 text-[11px]" disabled={selectedTaskDone || busy || reviewing} onClick={() => void handleDeleteSession()}>
+                            <Trash2 className="size-3" /> Hapus
+                          </Button>
+                        )}
+                      </div>
+                      <div className="text-muted-foreground flex items-center justify-between text-xs tabular-nums">
+                        <span>
+                          {activityMode === "review"
+                            ? (reviewing ? "Review berjalan" : "Review")
+                            : busy ? `Berjalan · ${Math.floor(elapsedSec / 60)}:${String(elapsedSec % 60).padStart(2, "0")}` : lastDoneAt ? `Selesai ${new Date(lastDoneAt).toLocaleTimeString()}` : "Log build"}
+                        </span>
+                        <span>{events.length} event</span>
+                      </div>
+                      <ActivityLog events={events} className="h-auto min-h-0 flex-1" />
+                    </TabsContent>
+                    <TabsContent value="review" className="mt-2 flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-sm font-semibold">Review implementasi</p>
+                        {reviewing ? (
+                          <Button size="sm" variant="destructive" onClick={handleStopReview} disabled={busy || !ready}>
+                            <Square className="size-3.5" />
+                            Stop review
+                          </Button>
+                        ) : (
+                          <p className="text-muted-foreground text-xs">Pilih mode Review untuk menjalankan pemeriksaan.</p>
+                        )}
+                      </div>
+                      {reviewError && <p className="text-destructive text-xs">{reviewError}</p>}
+                      {reviewing && <p className="text-muted-foreground text-xs">Memeriksa implementasi dan test secara read-only…</p>}
+                      {selected.implementationReview ? (
+                        <article className="min-h-0 space-y-2 rounded-md border bg-background p-3 shadow-sm">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <Badge
+                              variant="outline"
+                              className={
+                                selected.implementationReview.verdict === "implemented"
+                                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                                  : selected.implementationReview.verdict === "partial"
+                                    ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                                    : selected.implementationReview.verdict === "not_implemented"
+                                      ? "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400"
+                                      : ""
+                              }
+                            >
+                              {selected.implementationReview.verdict === "implemented" ? "Terimplementasi" : selected.implementationReview.verdict === "partial" ? "Parsial" : selected.implementationReview.verdict === "not_implemented" ? "Belum terimplementasi" : "Belum jelas"}
+                            </Badge>
+                            <span className="text-muted-foreground text-[10px] tabular-nums">
+                              {new Date(selected.implementationReview.reviewedAt).toLocaleString()}
+                              {selected.implementationReview.agent ? ` · ${selected.implementationReview.agent}` : ""}
+                            </span>
+                          </div>
+                          <div className="md-preview font-sans text-xs text-foreground">
+                            <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>{selected.implementationReview.summary}</ReactMarkdown>
+                          </div>
+                        </article>
+                      ) : (
+                        <p className="text-muted-foreground rounded-md border border-dashed p-4 text-center text-xs">Belum ada review implementasi untuk task ini.</p>
+                      )}
+                    </TabsContent>
+                    <TabsContent value="history" className="mt-2 min-h-0 flex-1 overflow-y-auto">
+                      {(selected.builds ?? []).length === 0 ? (
+                        <p className="text-muted-foreground rounded-md border border-dashed p-4 text-center text-xs">Belum ada riwayat build.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-3 border-b px-1 pb-2">
+                            <div>
+                              <p className="text-xs font-semibold">Total penggunaan task</p>
+                              <p className="text-muted-foreground text-[10px]">Akumulasi {selected.builds?.length ?? 0} run · {cumulativeTokenUsage.runCount} run dengan data token</p>
+                            </div>
+                            <div className="text-right">
+                              <p className="font-mono text-sm font-semibold tabular-nums">
+                                {cumulativeTokenUsage.runCount > 0 ? `${formatTokenCount(cumulativeTokenUsage.total)} token` : "Data token belum tersedia"}
+                              </p>
+                              <p className="text-muted-foreground text-[10px]">{formatElapsed(cumulativeBuildDurationMs)} total durasi</p>
+                              {cumulativeTokenUsage.costRunCount > 0 && (
+                                <p className="text-muted-foreground text-[10px]">{formatUsd(cumulativeTokenUsage.costUsd)} estimasi biaya</p>
+                              )}
+                            </div>
+                          </div>
+                          {(selected.builds ?? []).map((build) => (
+                            <article
+                              key={build.id}
+                              className={`space-y-3 rounded-md border border-l-[3px] bg-background p-3 text-xs shadow-sm ${
+                                build.status === "done"
+                                  ? "border-l-emerald-500"
+                                  : build.status === "error"
+                                    ? "border-l-destructive"
+                                    : build.status === "stopped"
+                                      ? "border-l-amber-500"
+                                      : build.status === "interrupted"
+                                        ? "border-l-orange-500"
+                                      : "border-l-sky-500"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0 space-y-1.5">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <Badge variant={build.status === "done" ? "secondary" : build.status === "running" ? "default" : "outline"}>
+                                      {build.status === "done" ? "Sukses" : build.status === "error" ? "Gagal" : build.status === "stopped" ? "Dihentikan" : build.status === "interrupted" ? "Terinterupsi" : "Berjalan"}
+                                    </Badge>
+                                    <Badge variant="outline" className="text-[10px]">{build.mode === "review" ? "Review" : "Build"}</Badge>
+                                    <p className="min-w-0 truncate text-sm font-semibold">{build.modelName ?? build.model ?? "Model tidak tercatat"}</p>
+                                  </div>
+                                  {build.modelName && build.model && build.modelName !== build.model && (
+                                    <p className="text-muted-foreground break-all font-mono text-[10px]">{build.model}</p>
+                                  )}
+                                </div>
+                                <div className="shrink-0 text-right">
+                                  <p className="font-mono text-sm font-semibold tabular-nums">{formatElapsed(build.elapsedMs)}</p>
+                                  <p className="text-muted-foreground text-[10px]">durasi run</p>
+                                </div>
+                              </div>
+                              <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2 sm:grid-cols-4">
+                                <div className="min-w-0">
+                                  <dt className="text-muted-foreground text-[10px]">Mulai</dt>
+                                  <dd className="mt-0.5 tabular-nums">{new Date(build.startedAt).toLocaleString()}</dd>
+                                </div>
+                                <div className="min-w-0">
+                                  <dt className="text-muted-foreground text-[10px]">Selesai</dt>
+                                  <dd className="mt-0.5 tabular-nums">{build.finishedAt ? new Date(build.finishedAt).toLocaleString() : "Berjalan"}</dd>
+                                </div>
+                                <div className="min-w-0">
+                                  <dt className="text-muted-foreground text-[10px]">Agent</dt>
+                                  <dd className="mt-0.5 truncate">{build.agent ?? "—"}</dd>
+                                </div>
+                                <div className="min-w-0">
+                                  <dt className="text-muted-foreground text-[10px]">Event</dt>
+                                  <dd className="mt-0.5 tabular-nums">{build.eventCount}</dd>
+                                </div>
+                              </dl>
+                              {build.statusMessage && <p className="rounded-sm bg-muted/40 px-2 py-1.5 text-muted-foreground">{build.statusMessage}</p>}
+                              {build.usage && (
+                                <div className="space-y-1 border-t pt-2">
+                                  <p className="text-muted-foreground text-[10px] font-semibold">Penggunaan token</p>
+                                  <dl className="grid grid-cols-2 gap-x-3 gap-y-1 sm:grid-cols-3">
+                                    <div><dt className="text-muted-foreground text-[10px]">Total</dt><dd className="font-mono tabular-nums">{formatTokenCount(build.usage.total)}</dd></div>
+                                    <div><dt className="text-muted-foreground text-[10px]">Input</dt><dd className="font-mono tabular-nums">{formatTokenCount(build.usage.input)}</dd></div>
+                                    <div><dt className="text-muted-foreground text-[10px]">Output</dt><dd className="font-mono tabular-nums">{formatTokenCount(build.usage.output)}</dd></div>
+                                    <div><dt className="text-muted-foreground text-[10px]">Reasoning</dt><dd className="font-mono tabular-nums">{formatTokenCount(build.usage.reasoning)}</dd></div>
+                                    <div><dt className="text-muted-foreground text-[10px]">Cache read / write</dt><dd className="font-mono tabular-nums">{formatTokenCount(build.usage.cacheRead)} / {formatTokenCount(build.usage.cacheWrite)}</dd></div>
+                                    {build.usage.costUsd !== undefined && <div><dt className="text-muted-foreground text-[10px]">Biaya</dt><dd className="font-mono tabular-nums">{formatUsd(build.usage.costUsd)}</dd></div>}
+                                  </dl>
+                                </div>
+                              )}
+                              {build.sessionId && (
+                                <p className="text-muted-foreground break-all font-mono text-[10px]">Sesi {build.sessionId}</p>
+                              )}
+                              {build.summary && (
+                                <details className="rounded-md bg-muted/30 px-2 py-1.5">
+                                  <summary className="text-muted-foreground cursor-pointer text-[10px]">Ringkasan build</summary>
+                                  <div className="md-preview mt-1 max-h-56 overflow-y-auto font-sans text-xs text-foreground">
+                                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>{build.summary}</ReactMarkdown>
+                                  </div>
+                                </details>
+                              )}
+                              {build.goal && (
+                                <div className="space-y-0.5">
+                                  <p className="text-muted-foreground text-[10px]">Instruksi tambahan</p>
+                                  <p className="line-clamp-3 whitespace-pre-wrap">{build.goal}</p>
+                                </div>
+                              )}
+                              {build.files.length > 0 && (
+                                <div className="space-y-1">
+                                  <p className="text-muted-foreground text-[10px]">File tersentuh · {build.files.length}</p>
+                                  <ul className="max-h-28 list-inside list-disc space-y-1 overflow-y-auto pl-1 marker:text-muted-foreground">
+                                    {build.files.map((file) => <li key={file} className="min-w-0"><code className="break-all font-mono text-[10px]">{file}</code></li>)}
+                                  </ul>
+                                </div>
+                              )}
+                            </article>
+                          ))}
+                        </div>
+                      )}
+                    </TabsContent>
+                  </Tabs>
+                </div>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <HaltDialog
+        halt={halt}
+        busy={answeringHalt}
+        onSubmit={handleHaltAnswer}
+        onClose={() => setHalt(null)}
+      />
     </div>
   );
 }

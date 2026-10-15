@@ -1,6 +1,8 @@
 // Core data model for BMAD Studio.
 // Mirrors the official BMad Method roadmap (see module-help.csv).
 
+import type { TokenUsage } from "../opencode/types";
+
 export type ArtifactStatus = "not-started" | "draft" | "complete";
 
 /** The high-level BMAD phases, in delivery order. */
@@ -59,14 +61,32 @@ export type TaskStatus = "backlog" | "todo" | "in-progress" | "review" | "done";
 /** Ringkasan satu run build pada task (log penuh hanya di memori sesi). */
 export interface TaskBuild {
   id: string;
+  mode?: "build" | "review";
   goal: string;
-  status: "running" | "done" | "error" | "stopped";
+  summary?: string;
+  status: "running" | "done" | "error" | "stopped" | "interrupted";
+  statusMessage?: string;
+  model?: string;
+  modelName?: string;
+  agent?: string;
+  sessionId?: string;
+  usage?: TokenUsage;
   startedAt: string;
   finishedAt?: string;
   elapsedMs?: number;
   eventCount: number;
   /** Path file yang tersentuh agen (diekstrak dari judul tool). */
   files: string[];
+}
+
+export type ImplementationVerdict = "implemented" | "partial" | "not_implemented" | "unclear";
+
+export interface TaskImplementationReview {
+  verdict: ImplementationVerdict;
+  summary: string;
+  reviewedAt: string;
+  model?: string;
+  agent?: string;
 }
 
 /** Satu unit kerja di papan Eksekusi (story/task). */
@@ -80,8 +100,11 @@ export interface ExecTask {
   /** Prioritas pengerjaan — menentukan urutan "kerjakan berikutnya". */
   priority: TaskPriority;
   status: TaskStatus;
-  /** Riwayat build terakhir (maks 3, terbaru dulu). */
+  /** Riwayat semua build task, terbaru dulu. */
   builds?: TaskBuild[];
+  implementationReview?: TaskImplementationReview;
+  archivedAt?: string;
+  deletedAt?: string;
   /**
    * Session khusus task ini. Jika undefined, build memakai project.sessionId
    * (shared session). Saat user klik "New session", field ini diisi dengan
