@@ -1,7 +1,7 @@
 "use client";
 import { useRef, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import { Loader2, Sparkles, Check, X, Circle, TriangleAlert, LayoutDashboard, FolderDown, FolderUp } from "lucide-react";
+import { Loader2, Sparkles, Check, X, Circle, TriangleAlert, LayoutDashboard } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -14,7 +14,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { useStudio } from "@/lib/store";
 import { useHydrated } from "@/lib/use-hydrated";
-import { stepById, STEPS, PHASES, stepsForScale } from "@/lib/bmad/roadmap";
+import { stepById, PHASES, stepsForScale } from "@/lib/bmad/roadmap";
 import { PlanOverview } from "@/components/bmad/plan-overview";
 import { TEMPLATES, draftSkeleton } from "@/lib/bmad/templates";
 import { normalizeMarkdown } from "@/lib/bmad/markdown";
@@ -27,26 +27,7 @@ import { ArtifactEditor, type DraftMode } from "@/components/bmad/artifact-edito
 import { AgentPanel } from "@/components/bmad/agent-panel";
 import { opencode } from "@/lib/opencode/client";
 import { directAI } from "@/lib/ai/client";
-import { projectFiles } from "@/lib/project-files/client";
 import type { Project, StepId } from "@/lib/bmad/types";
-
-/** Build an ordered context chain from the project's artifacts (roadmap order),
- *  so later phases are drafted from what earlier phases already captured.
- *  project.description acts as the seed when nothing is authored yet. */
-function artifactContext(project: Project): string {
-  const order = STEPS.map((s) => s.id);
-  const entries = Object.entries(project.artifacts)
-    .filter(([, a]) => a.content.trim().length > 0)
-    .sort(([a], [b]) => order.indexOf(a as StepId) - order.indexOf(b as StepId));
-
-  if (!entries.length) {
-    return `Project: ${project.name}. ${project.description}`;
-  }
-  const chain = entries
-    .map(([stepId, a]) => `### ${stepById(stepId as StepId)?.name ?? stepId}\n${a.content.trim()}`)
-    .join("\n\n");
-  return `Project: ${project.name}. ${project.description}\n\nContext (prior BMAD artifacts, in order):\n${chain}`;
-}
 
 export function PlanWorkspace({ project }: { project: Project }) {
   const settings = useStudio((s) => s.settings);
@@ -66,10 +47,8 @@ export function PlanWorkspace({ project }: { project: Project }) {
   const [bulkConfirmOpen, setBulkConfirmOpen] = useState(false);
   const [bulkModalOpen, setBulkModalOpen] = useState(false);
   const bulkCancelRef = useRef(false);
-  // Sync artefak ↔ folder project (docs/bmad).
-  const [syncing, setSyncing] = useState(false);
-  const [importing, setImporting] = useState(false);
-  const [fileMsg, setFileMsg] = useState<string | null>(null);
+  // Sync artefak ↔ folder project (docs/bmad) pindah ke card "Progress
+  // workspace" (FolderSyncButtons) di app/projects/[id]/page.tsx.
   // Explicit choice: Manual (wizard form, local) vs Agent (AI draft via
   // OpenCode / Direct AI depending on Settings → Guidance via).
   const [draftMode, setDraftMode] = useState<DraftMode>("manual");
@@ -107,52 +86,6 @@ export function PlanWorkspace({ project }: { project: Project }) {
   const overviewActive = selectedStepId === null;
   const nextOverviewId = nextStepId(project) as StepId | undefined;
   const nextOverviewStep = nextOverviewId ? stepById(nextOverviewId) : undefined;
-
-  async function handleSyncToFolder() {
-    if (!project.directory || syncing) return;
-    setSyncing(true);
-    setFileMsg(null);
-    try {
-      const files = STEPS.map((s) => ({
-        filename: s.output,
-        content: project.artifacts[s.id]?.content ?? "",
-      })).filter((f) => f.content.trim().length > 0);
-      if (files.length === 0) {
-        setFileMsg("Belum ada artefak berisi untuk disync.");
-        return;
-      }
-      const res = await projectFiles.sync(project.directory, files);
-      setFileMsg(`Tersync ${res.written.length} file ke docs/bmad/${res.skipped.length > 0 ? ` (${res.skipped.length} dilewati)` : ""}.`);
-    } catch (e) {
-      setFileMsg(e instanceof Error ? e.message : "Sync gagal");
-    } finally {
-      setSyncing(false);
-    }
-  }
-
-  async function handleImportFromFolder() {
-    if (!project.directory || importing) return;
-    setImporting(true);
-    setFileMsg(null);
-    try {
-      const res = await projectFiles.read(project.directory);
-      const byOutput = new Map(STEPS.map((s) => [s.output, s.id]));
-      let n = 0;
-      for (const [filename, content] of Object.entries(res.files)) {
-        const stepId = byOutput.get(filename) as StepId | undefined;
-        if (!stepId || !content.trim()) continue;
-        const cur = project.artifacts[stepId];
-        if (cur?.content.trim() === content.trim()) continue;
-        setArtifactContent(project.id, stepId, content, cur?.status === "complete" ? "complete" : "draft");
-        n++;
-      }
-      setFileMsg(n > 0 ? `Diimpor ${n} artefak dari docs/bmad/.` : "Tidak ada file baru di docs/bmad/.");
-    } catch (e) {
-      setFileMsg(e instanceof Error ? e.message : "Impor gagal");
-    } finally {
-      setImporting(false);
-    }
-  }
 
   const hasDirectory = Boolean(project.directory);
   // Direct AI needs no OpenCode session, so drafting works without a directory.
@@ -357,15 +290,6 @@ export function PlanWorkspace({ project }: { project: Project }) {
                   )}
                 </p>
               )}
-              <div className="flex flex-col gap-1.5">
-                <Button size="sm" variant="outline" className="w-full justify-start" disabled={!hasDirectory || syncing} onClick={handleSyncToFolder}>
-                  {syncing ? <Loader2 className="size-3.5 animate-spin" /> : <FolderDown className="size-3.5" />} Sync ke folder
-                </Button>
-                <Button size="sm" variant="outline" className="w-full justify-start" disabled={!hasDirectory || importing} onClick={handleImportFromFolder}>
-                  {importing ? <Loader2 className="size-3.5 animate-spin" /> : <FolderUp className="size-3.5" />} Impor dari folder
-                </Button>
-              </div>
-              {fileMsg && <p className="text-xs text-muted-foreground">{fileMsg}</p>}
             </div>
             <PhaseStepper
               project={project}
