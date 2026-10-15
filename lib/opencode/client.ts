@@ -28,7 +28,8 @@ const post = <T,>(url: string, body: unknown) =>
 
 export const opencode = {
   /** All providers with their models and connection status. */
-  providers: () => json<{ providers: ProviderInfo[] }>("/api/opencode/providers"),
+  providers: () =>
+    json<{ providers: ProviderInfo[]; integrationIds?: string[] }>("/api/opencode/providers"),
 
   /** Set a provider API key on the OpenCode server. */
   setAuth: (providerID: string, key: string) =>
@@ -96,7 +97,20 @@ export const opencode = {
 
 /** Flatten providers into a single list of selectable model options. */
 export function flattenModels(providers: ProviderInfo[]): ModelOption[] {
-  return providers.flatMap((p) => p.models.map((m) => ({ ...m, providerID: p.id })));
+  // The server can list the same model id under multiple providers (or even
+  // twice for one provider). Duplicate ids break React keys *and* the Select
+  // value, so keep the first occurrence of each id.
+  const seen = new Set<string>();
+  const out: ModelOption[] = [];
+  for (const p of providers) {
+    for (const m of p.models) {
+      const id = m.id || `${p.id}/${m.modelID}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({ ...m, id, providerID: m.providerID || p.id });
+    }
+  }
+  return out;
 }
 
 export type { ActivityEvent, ChatMessage, ModelOption, OpenCodeAgent, OpenCodeProject, ProviderInfo };

@@ -19,7 +19,7 @@
 import "server-only";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -32,12 +32,17 @@ const DEFAULT_BASE = `http://127.0.0.1:${OPENCODE_PORT}`;
 const DEFAULT_USERNAME = "opencode";
 const CONFIG_DIR = join(homedir(), ".config", "bmad-studio");
 const CONFIG_FILE = join(CONFIG_DIR, "opencode.json");
+const PROJECTS_FILE = join(CONFIG_DIR, "projects.json");
 
 interface PersistedServerSettings {
   opencodeServerUrl?: string;
   username?: string;
   password?: string;
   autoStart?: boolean;
+  defaultModel?: string;
+  defaultAgent?: string;
+  buildAgent?: string;
+  guidanceMode?: string;
 }
 
 function readConfig(): PersistedServerSettings {
@@ -55,6 +60,40 @@ function writeConfig(patch: Partial<PersistedServerSettings>): PersistedServerSe
   writeFileSync(CONFIG_FILE, JSON.stringify(settings, null, 2), { mode: 0o600 });
   chmodSync(CONFIG_FILE, 0o600);
   return settings;
+}
+
+export interface ProjectsFile {
+  /** Raw parsed value; callers validate/normalize the shape. */
+  projects: unknown;
+  /** False when no file exists yet (first run). */
+  persisted: boolean;
+}
+
+/** Read the server-side projects file (`~/.config/bmad-studio/projects.json`). */
+export function readProjectsFile(): ProjectsFile {
+  try {
+    if (!existsSync(PROJECTS_FILE)) return { projects: [], persisted: false };
+    const parsed: unknown = JSON.parse(readFileSync(PROJECTS_FILE, "utf8"));
+    const projects = (parsed as { projects?: unknown })?.projects ?? parsed;
+    return { projects, persisted: true };
+  } catch {
+    return { projects: [], persisted: false };
+  }
+}
+
+/**
+ * Atomically replace the server-side projects file (write temp + rename).
+ * Expects an array; minimal shape validation happens here, full
+ * normalization happens on the client.
+ */
+export function writeProjectsFile(projects: unknown): { count: number } {
+  if (!Array.isArray(projects)) throw new Error("Projects payload must be an array.");
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${PROJECTS_FILE}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ projects }, null, 2), { mode: 0o600 });
+  renameSync(tmp, PROJECTS_FILE);
+  chmodSync(PROJECTS_FILE, 0o600);
+  return { count: projects.length };
 }
 
 export function readPersistedBaseUrl(): string | undefined {
@@ -77,6 +116,10 @@ export function readServerSettings() {
     username: configuredUsername(),
     passwordConfigured: Boolean(envPassword() || config.password),
     autoStart: config.autoStart !== false,
+    defaultModel: config.defaultModel,
+    defaultAgent: config.defaultAgent,
+    buildAgent: config.buildAgent,
+    guidanceMode: config.guidanceMode,
   };
 }
 
@@ -88,6 +131,10 @@ export function persistServerSettings(input: {
   opencodeServerUrl?: string;
   username?: string;
   password?: string;
+  defaultModel?: string;
+  defaultAgent?: string;
+  buildAgent?: string;
+  guidanceMode?: string;
 }): { opencodeServerUrl: string; username: string } {
   const patch: Partial<PersistedServerSettings> = {};
   if (input.opencodeServerUrl !== undefined) {
@@ -101,6 +148,37 @@ export function persistServerSettings(input: {
     patch.username = value;
   }
   if (input.password) patch.password = input.password;
+  const studioKeys = ["defaultModel", "defaultAgent", "buildAgent", "guidanceMode"] as const;
+  const hasStudioPatch = studioKeys.some((key) => input[key] !== undefined);
+  if (hasStudioPatch) {
+    // Studio defaults share the same JSON file. Apply them directly to the
+    // stored config so an empty string clears the override (client falls back
+    // to its built-in default) instead of persisting an empty value.
+    const current = readConfig();
+    for (const key of studioKeys) {
+      if (input[key] === undefined) continue;
+      const value = input[key]?.trim();
+      if (key === "guidanceMode") {
+        if (value !== "opencode" && value !== "direct") {
+          throw new Error('Guidance mode must be "opencode" or "direct".');
+        }
+        current[key] = value;
+        continue;
+      }
+      if (value) current[key] = value;
+      else delete current[key];
+    }
+    mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(CONFIG_FILE, JSON.stringify({ ...current, ...patch }, null, 2), {
+      mode: 0o600,
+    });
+    chmodSync(CONFIG_FILE, 0o600);
+    const config = readConfig();
+    return {
+      opencodeServerUrl: config.opencodeServerUrl || configuredBaseUrl(),
+      username: configuredUsername(),
+    };
+  }
   const config = writeConfig(patch);
   return {
     opencodeServerUrl: config.opencodeServerUrl || configuredBaseUrl(),
@@ -386,9 +464,17 @@ export async function saveServerSettings(input: {
   opencodeServerUrl?: string;
   username?: string;
   password?: string;
+  defaultModel?: string;
+  defaultAgent?: string;
+  buildAgent?: string;
+  guidanceMode?: string;
 }) {
   const saved = persistServerSettings(input);
-  await stopOwnedServer();
-  handle = undefined;
+  // Studio default changes don't affect the running server connection, so only
+  // restart the owned server when connection settings changed.
+  if (input.opencodeServerUrl !== undefined || input.username !== undefined || input.password) {
+    await stopOwnedServer();
+    handle = undefined;
+  }
   return saved;
 }
