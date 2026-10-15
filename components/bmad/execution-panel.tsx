@@ -171,10 +171,31 @@ function interruptionStatusMessage(reason?: string): string {
 }
 
 function parseImplementationVerdict(text: string): TaskImplementationReview["verdict"] {
-  const value = text.match(/(?:^|\n)\s*VERDICT\s*:\s*(IMPLEMENTED|PARTIAL|NOT_IMPLEMENTED|UNCLEAR)\b/i)?.[1]?.toUpperCase();
-  if (value === "IMPLEMENTED") return "implemented";
-  if (value === "PARTIAL") return "partial";
-  if (value === "NOT_IMPLEMENTED") return "not_implemented";
+  // Normalisasi ringan: agen sering membungkus verdict dengan markdown
+  // (**VERDICT: IMPLEMENTED**, ## Verdict, `VERDICT`, dsb).
+  const normalized = text
+    .replace(/[*_`#>|]/g, " ")
+    .replace(/[—–]/g, "-")
+    .replace(/\s+/g, " ");
+  // 1. Pola eksplisit VERDICT (toleran: :, -, =, atau spasi).
+  const explicit = normalized.match(/\bVERDICT\s*[:=\-]?\s*(NOT_IMPLEMENTED|NOT IMPLEMENTED|IMPLEMENTED|PARTIAL|UNCLEAR)\b/i)?.[1]?.toUpperCase().replace(/\s+/g, "_");
+  if (explicit === "IMPLEMENTED") return "implemented";
+  if (explicit === "PARTIAL") return "partial";
+  if (explicit === "NOT_IMPLEMENTED") return "not_implemented";
+  if (explicit === "UNCLEAR") return "unclear";
+  // 2. Fallback label umum: Status / Kesimpulan / Hasil review.
+  const labeled = normalized.match(/\b(?:STATUS|KESIMPULAN|HASIL(?: REVIEW)?|CONCLUSION)\s*[:=\-]?\s*(BELUM TERIMPLEMENTASI|BELUM DIIMPLEMENTASIKAN|TIDAK TERIMPLEMENTASI|NOT IMPLEMENTED|TERIMPLEMENTASI SEPENUHNYA|FULLY IMPLEMENTED|TERIMPLEMENTASI|IMPLEMENTED|SEBAGIAN|PARTIALLY|PARTIAL|BELUM JELAS|UNCLEAR)\b/i)?.[1]?.toUpperCase();
+  if (labeled) {
+    if (/BELUM|TIDAK|NOT/.test(labeled)) return "not_implemented";
+    if (/SEPENUHNYA|FULLY|^TERIMPLEMENTASI$|^IMPLEMENTED$/.test(labeled)) return "implemented";
+    if (/SEBAGIAN|PARTIALLY|^PARTIAL$/.test(labeled)) return "partial";
+    return "unclear";
+  }
+  // 3. Fallback frasa bebas — NOT dicek dulu karena mengandung kata IMPLEMENTED.
+  if (/\bNOT[_\s-]*IMPLEMENTED\b/i.test(normalized) || /belum (terimplementasi|diimplementasikan)|tidak terimplementasi/i.test(normalized)) return "not_implemented";
+  if (/\bFULLY IMPLEMENTED\b/i.test(normalized) || /terimplementasi sepenuhnya|semua kriteria terpenuhi/i.test(normalized)) return "implemented";
+  if (/\bPARTIALLY IMPLEMENTED\b/i.test(normalized) || /\bPARTIAL\b/i.test(normalized) || /terimplementasi sebagian|sebagian terpenuhi/i.test(normalized)) return "partial";
+  if (/\bIMPLEMENTED\b/i.test(normalized) || /sudah terimplementasi|telah diimplementasikan/i.test(normalized)) return "implemented";
   return "unclear";
 }
 
@@ -416,6 +437,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
   const [busy, setBusy] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const activeReviewRunRef = useRef<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(project.sessionId ?? null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const reviewAbortRef = useRef<AbortController | null>(null);
@@ -1023,89 +1045,222 @@ export function ExecutionPanel({ project }: { project: Project }) {
     const controller = new AbortController();
     const reviewStartedAt = new Date();
     const reviewStartedAtMs = reviewStartedAt.getTime();
+    // eslint-disable-next-line react-hooks/purity -- runId dibuat sekali per aksi review (event handler), bukan saat render.
+    const runId = `rv_${reviewStartedAtMs.toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
     const sessionId = task.sessionId;
     activeSessionRef.current = sessionId ?? null;
     setCurrentSessionId(sessionId ?? null);
     reviewAbortRef.current = controller;
+    activeReviewRunRef.current = runId;
     setReviewing(true);
     setReviewError(null);
     setActivityMode("review");
+    // Ikuti alur build: langsung buka tab Activity agar log realtime terlihat.
+    // Kesimpulan review HANYA ditulis setelah event `done` dari stream OpenCode.
     setBuildDetailsTab("activity");
-    setEvents([
-      { kind: "info", title: `Review dimulai — ${task.title}`, detail: `Session: ${sessionId ?? "baru"}\nModel: ${reviewModel}` },
-      { kind: "thought", title: "Memeriksa implementasi dan bukti test", detail: "Membaca task, build terakhir, dan acceptance criteria tanpa mengubah file." },
-    ]);
+    setEvents([]);
+    setHalt(null);
+    let reviewSummary: string | undefined;
+    let reviewUsage: TokenUsage | undefined;
+    let reviewStatus: "running" | "done" | "error" | "stopped" | "interrupted" = "running";
+    let reviewStatusMessage: string | undefined;
     try {
-      const message = [
+      // Referensi build untuk prompt harus run mode build terakhir, bukan entry
+      // review sebelumnya — agar review memeriksa kode, bukan review lama.
+      const lastBuildForPrompt = (task.builds ?? []).find((b) => (b.mode ?? "build") === "build") ?? task.builds?.[0];
+      const prompt = [
         "Review apakah task ini benar-benar sudah diimplementasikan pada repository saat ini.",
-        "Bersikap read-only: jangan mengubah file, jangan membuat commit, dan jangan menyatakan selesai hanya dari build summary.",
+        "Bersikap read-only: JANGAN mengubah file, JANGAN menjalankan perintah yang mengubah state (no write/edit/commit), hanya baca file dan jalankan perintah baca/test bila perlu.",
         "Periksa implementasi dan test yang relevan. Cocokkan setiap acceptance criteria dengan bukti kode/test.",
+        "Jangan menyimpulkan dari build summary atau review sebelumnya — verifikasi langsung ke file di disk.",
         "Gunakan verdict tepat satu ini pada baris pertama: VERDICT: IMPLEMENTED, VERDICT: PARTIAL, VERDICT: NOT_IMPLEMENTED, atau VERDICT: UNCLEAR.",
         "Lalu tulis ulang summary review yang ringkas dengan bagian ## Summary, ## Evidence, dan ## Gaps. Sebutkan path file dan test konkret; jangan mengarang bukti.",
         `Task: ${task.title}`,
         `Epic: ${task.epic || "(tidak ada)"}`,
         `Detail dan acceptance criteria:\n${task.detail || "(tidak ada)"}`,
-        `Build terakhir:\nStatus: ${task.builds?.[0]?.status ?? "belum ada"}\nInstruksi: ${task.builds?.[0]?.goal ?? "(tidak ada)"}\nSummary agen: ${task.builds?.[0]?.summary ?? "(tidak ada)"}\nFile tercatat: ${(task.builds?.[0]?.files ?? []).join(", ") || "(tidak ada)"}`,
-      ].join("\n\n");
-      const result = await opencode.chat({
-        directory: project.directory,
-        sessionId,
-        message,
-        model: reviewModel,
-        agent: "plan",
-        title: `Implementation review — ${task.title}`,
+        `Build terakhir (mode build, bukan review lama):\nStatus: ${lastBuildForPrompt?.status ?? "belum ada"}\nInstruksi: ${lastBuildForPrompt?.goal ?? "(tidak ada)"}\nSummary agen: ${lastBuildForPrompt?.summary ?? "(tidak ada)"}\nFile tercatat: ${(lastBuildForPrompt?.files ?? []).join(", ") || "(tidak ada)"}\nReview sebelumnya (jangan jadikan bukti, hanya konteks):\n${task.implementationReview ? `Verdict: ${task.implementationReview.verdict}\n${task.implementationReview.summary}` : "(belum ada)"}`,
+      ].join("\n\n") + (goalOverride?.trim() ? `\n\nKonteks tambahan dari user:\n${goalOverride.trim()}` : "");
+      setEvents([
+        { kind: "info", title: `Review dimulai — ${task.title}`, detail: `Run: ${runId}\nSession: ${sessionId ?? "baru"}\nModel: ${reviewModel}` },
+      ]);
+      const res = await fetch("/api/opencode/stream", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          directory: project.directory,
+          sessionId,
+          prompt,
+          model: reviewModel,
+          agent: settings.buildAgent,
+          title: `Implementation review — ${task.title}`,
+        }),
         signal: controller.signal,
       });
-      if (result.sessionId !== task.sessionId) setTaskSession(project.id, task.id, result.sessionId);
-      activeSessionRef.current = result.sessionId;
-      setCurrentSessionId(result.sessionId);
-      const review: TaskImplementationReview = {
-        verdict: parseImplementationVerdict(result.text),
-        summary: result.text.trim(),
-        reviewedAt: new Date().toISOString(),
-        model: reviewModel,
-        agent: "plan",
+      if (!res.ok || !res.body) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data?.error ?? `Request failed (${res.status})`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let sawDone = false;
+      const pushLog = (e: ActivityEvent) => {
+        if (activeReviewRunRef.current !== runId) return;
+        setEvents((prev) => [...prev, e]);
       };
-      const reviewFinishedAt = new Date();
-      const reviewFinishedAtMs = reviewFinishedAt.getTime();
-      const reviewBuildEntry: TaskBuild = {
-        id: `rv_${reviewStartedAtMs.toString(36)}`,
-        mode: "review",
-        goal: `Review implementation — ${task.title}`,
-        summary: result.text.trim(),
-        status: "done",
-        model: reviewModel,
-        modelName: models.find((model) => model.id === reviewModel)?.name ?? reviewModel,
-        agent: "plan",
-        sessionId: result.sessionId,
-        usage: result.usage,
-        statusMessage: `Verdict review: ${review.verdict}`,
-        startedAt: reviewStartedAt.toISOString(),
-        finishedAt: reviewFinishedAt.toISOString(),
-        elapsedMs: reviewFinishedAtMs - reviewStartedAtMs,
-        eventCount: 2,
-        files: extractFiles(events),
-      };
-      updateTask(project.id, task.id, {
-        implementationReview: review,
-        builds: [reviewBuildEntry, ...(task.builds ?? [])],
-      });
-      setEvents((prev) => [
-        ...prev,
-        { kind: "done", title: `Review selesai · ${review.verdict}`, detail: review.summary },
-      ]);
-      notify({ kind: "success", title: `Review selesai: ${review.verdict}`, description: task.title });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() ?? "";
+        for (const chunk of chunks) {
+          let eventName = "message";
+          let dataStr = "";
+          for (const line of chunk.split("\n")) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+          }
+          if (!dataStr) continue;
+          let payload: unknown;
+          try { payload = JSON.parse(dataStr); } catch { continue; }
+          if (activeReviewRunRef.current !== runId) continue;
+          if (eventName === "session") {
+            const { sessionId: sid } = payload as { sessionId?: string };
+            if (sid) {
+              activeSessionRef.current = sid;
+              setCurrentSessionId(sid);
+              if (sid !== task.sessionId) setTaskSession(project.id, task.id, sid);
+            }
+          } else if (eventName === "log") {
+            pushLog(payload as ActivityEvent);
+          } else if (eventName === "halt") {
+            setHalt(payload as HaltRequest);
+          } else if (eventName === "halt_resolved") {
+            setHalt(null);
+          } else if (eventName === "done") {
+            sawDone = true;
+            const dp = payload as { summary?: unknown; usage?: TokenUsage };
+            reviewSummary = typeof dp.summary === "string" ? dp.summary.trim() || undefined : undefined;
+            reviewUsage = dp.usage;
+            if (reviewStatus === "running") reviewStatus = "done";
+          } else if (eventName === "error") {
+            reviewStatus = "error";
+            const em = payload as { message?: string; usage?: TokenUsage };
+            reviewStatusMessage = em.message ?? "Review error";
+            reviewUsage = em.usage;
+            setReviewError(reviewStatusMessage);
+          } else if (eventName === "interrupted") {
+            const im = payload as { reason?: string; usage?: TokenUsage };
+            reviewStatus = "interrupted";
+            reviewStatusMessage = interruptionStatusMessage(im.reason);
+            reviewUsage = im.usage;
+          }
+        }
+      }
+      if (activeReviewRunRef.current !== runId) return;
+      if (!sawDone && !controller.signal.aborted && reviewStatus === "running") {
+        reviewStatus = "error";
+        reviewStatusMessage = "Koneksi terputus sebelum review selesai. Review belum disimpulkan — jalankan ulang.";
+        setReviewError(reviewStatusMessage);
+      }
+      if (sawDone && reviewStatus === "done" && reviewSummary) {
+        // Summary SSE kadang hanya kalimat penutup — ambil teks penuh sesi agar
+        // verdict tidak hilang (penyebab IMPLEMENTED terbaca UNCLEAR).
+        const finalSessionId = activeSessionRef.current ?? sessionId ?? undefined;
+        let verdictSource = reviewSummary;
+        try {
+          if (finalSessionId) {
+            const msgRes = await opencode.messages(project.directory, finalSessionId);
+            const fullText = (msgRes.messages ?? [])
+              .filter((m) => m.role === "assistant" && m.text?.trim())
+              .map((m) => m.text.trim())
+              .join("\n\n");
+            if (fullText && parseImplementationVerdict(fullText) !== "unclear") {
+              verdictSource = fullText.length > 12000 ? fullText.slice(-12000) : fullText;
+            }
+          }
+        } catch {
+          // Fallback ke summary SSE bila riwayat sesi gagal dibaca.
+        }
+        const review: TaskImplementationReview = {
+          verdict: parseImplementationVerdict(verdictSource),
+          summary: reviewSummary,
+          reviewedAt: new Date().toISOString(),
+          model: reviewModel,
+          agent: settings.buildAgent,
+        };
+        const doneAt = new Date();
+        const entry: TaskBuild = {
+          id: runId,
+          mode: "review",
+          goal: goalOverride?.trim() ? `Review implementation — ${task.title}\n\nKonteks tambahan:\n${goalOverride.trim()}` : `Review implementation — ${task.title}`,
+          summary: reviewSummary,
+          status: "done",
+          model: reviewModel,
+          modelName: models.find((m) => m.id === reviewModel)?.name ?? reviewModel,
+          agent: settings.buildAgent,
+          sessionId: activeSessionRef.current ?? sessionId ?? undefined,
+          usage: reviewUsage,
+          statusMessage: `Verdict review: ${review.verdict}`,
+          startedAt: reviewStartedAt.toISOString(),
+          finishedAt: doneAt.toISOString(),
+          elapsedMs: doneAt.getTime() - reviewStartedAtMs,
+          eventCount: 0,
+          files: [],
+        };
+        setEvents((prev) => {
+          entry.eventCount = prev.length;
+          entry.files = extractFiles(prev);
+          return [...prev, { kind: "done", title: `Review selesai · ${review.verdict}`, detail: `Run: ${runId}\n${review.summary}` }];
+        });
+        updateTask(project.id, task.id, {
+          implementationReview: review,
+          builds: [entry, ...(task.builds ?? [])],
+        });
+        setBuildDetailsTab("review");
+        notify({ kind: "success", title: `Review selesai: ${review.verdict}`, description: task.title });
+      } else if (reviewStatus !== "running") {
+        const doneAt = new Date();
+        const aborted = controller.signal.aborted;
+        const entry: TaskBuild = {
+          id: runId,
+          mode: "review",
+          goal: `Review implementation — ${task.title}`,
+          summary: reviewStatusMessage ?? reviewSummary ?? "Review tidak selesai.",
+          status: aborted ? "stopped" : reviewStatus === "interrupted" ? "interrupted" : "error",
+          statusMessage: aborted ? "Review dihentikan melalui tombol Stop." : reviewStatusMessage,
+          model: reviewModel,
+          modelName: models.find((m) => m.id === reviewModel)?.name ?? reviewModel,
+          agent: settings.buildAgent,
+          sessionId: activeSessionRef.current ?? sessionId ?? undefined,
+          usage: reviewUsage,
+          startedAt: reviewStartedAt.toISOString(),
+          finishedAt: doneAt.toISOString(),
+          elapsedMs: doneAt.getTime() - reviewStartedAtMs,
+          eventCount: 0,
+          files: [],
+        };
+        setEvents((prev) => {
+          entry.eventCount = prev.length;
+          return [...prev, { kind: "error", title: "Review gagal", detail: `Run: ${runId}\n${entry.summary}` }];
+        });
+        updateTask(project.id, task.id, { builds: [entry, ...(task.builds ?? [])] });
+        notify({ kind: aborted ? "info" : "error", title: aborted ? "Review dihentikan" : "Review gagal", description: aborted ? task.title : (reviewStatusMessage ?? "Review tidak selesai.") });
+      }
     } catch (reviewFailure) {
+      // Guard: error dari run lama tidak boleh menimpa run baru.
+      if (activeReviewRunRef.current !== runId) return;
       const aborted = reviewFailure instanceof Error && reviewFailure.name === "AbortError";
       const message = aborted ? "Review dihentikan." : reviewFailure instanceof Error ? reviewFailure.message : "Review gagal dijalankan.";
       setReviewError(message);
       setEvents((prev) => [
         ...prev,
-        { kind: "error", title: "Review gagal", detail: message },
+        { kind: "error", title: "Review gagal", detail: `Run: ${runId}\n${message}` },
       ]);
       const reviewFinishedAt = new Date();
       const failedReviewBuild: TaskBuild = {
-        id: `rv_${reviewStartedAtMs.toString(36)}`,
+        id: runId,
         mode: "review",
         goal: `Review implementation — ${task.title}`,
         summary: message,
@@ -1113,27 +1268,37 @@ export function ExecutionPanel({ project }: { project: Project }) {
         statusMessage: aborted ? "Review dihentikan melalui tombol Stop." : message,
         model: reviewModel,
         modelName: models.find((model) => model.id === reviewModel)?.name ?? reviewModel,
-        agent: "plan",
-        sessionId: task.sessionId,
+        agent: settings.buildAgent,
+        sessionId: activeSessionRef.current ?? sessionId ?? undefined,
         startedAt: reviewStartedAt.toISOString(),
         finishedAt: reviewFinishedAt.toISOString(),
         elapsedMs: reviewFinishedAt.getTime() - reviewStartedAtMs,
-        eventCount: 2,
+        eventCount: 0,
         files: [],
       };
+      setEvents((prev) => {
+        failedReviewBuild.eventCount = prev.length;
+        return prev;
+      });
       updateTask(project.id, task.id, { builds: [failedReviewBuild, ...(task.builds ?? [])] });
       notify({ kind: aborted ? "info" : "error", title: aborted ? "Review dihentikan" : "Review gagal", description: aborted ? task.title : message });
     } finally {
-      if (reviewAbortRef.current === controller) reviewAbortRef.current = null;
-      setReviewing(false);
+      // Hanya run aktif yang boleh membuka kunci waiting state.
+      if (activeReviewRunRef.current === runId) {
+        activeReviewRunRef.current = null;
+        if (reviewAbortRef.current === controller) reviewAbortRef.current = null;
+        setReviewing(false);
+      }
     }
   }
 
   function handleStopReview() {
     if (!reviewAbortRef.current) return;
     reviewAbortRef.current.abort();
+    activeReviewRunRef.current = null;
     setReviewError("Review dihentikan.");
     setReviewing(false);
+    setHalt(null);
   }
 
   async function handleDeleteSession() {
@@ -1168,6 +1333,8 @@ export function ExecutionPanel({ project }: { project: Project }) {
 
   // Resolve a halt the agent paused on: approve/reject a tool permission or
   // answer an agent question. The stream stays open and resumes on reply.
+  // Dipakai bersama oleh build (busy) maupun review (reviewing) karena
+  // keduanya sekarang memakai /api/opencode/stream yang sama.
   async function handleHaltAnswer(answer: HaltAnswer) {
     const current = halt;
     const sessionId = activeSessionRef.current;
@@ -1983,7 +2150,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
                         )}
                       </div>
                       {reviewError && <p className="text-destructive text-xs">{reviewError}</p>}
-                      {reviewing && <p className="text-muted-foreground text-xs">Memeriksa implementasi dan test secara read-only…</p>}
+                      {reviewing && <p className="text-muted-foreground text-xs">Memeriksa implementasi dan test secara read-only… ikuti log realtime di tab Activity.</p>}
                       {selected.implementationReview ? (
                         <article className="min-h-0 space-y-2 rounded-md border bg-background p-3 shadow-sm">
                           <div className="flex flex-wrap items-center justify-between gap-2">
