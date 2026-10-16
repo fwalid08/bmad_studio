@@ -3,15 +3,21 @@ import { clientFor } from "@/lib/opencode/server";
 
 // GET ?directory=<abs path> — list chat sessions for a project directory.
 export async function GET(req: Request) {
-  const directory = new URL(req.url).searchParams.get("directory") ?? undefined;
+  const params = new URL(req.url).searchParams;
+  const directory = params.get("directory") ?? undefined;
+  const sessionId = params.get("sessionId") ?? undefined;
+  const includeActiveSessions = params.get("includeActive") === "true";
   if (!directory) {
     return NextResponse.json({ error: "Missing directory" }, { status: 400 });
   }
   try {
     const client = await clientFor();
     const out = await client.session.list({ directory });
+    const active = sessionId || includeActiveSessions ? await client.session.active() : undefined;
     return NextResponse.json({
       sessions: (out.data ?? []).map((s) => ({ id: s.id, title: s.title ?? "" })),
+      ...(includeActiveSessions ? { activeSessionIds: Object.keys(active ?? {}) } : {}),
+      ...(sessionId ? { active: Boolean(active?.[sessionId]) } : {}),
     });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Failed to list sessions";

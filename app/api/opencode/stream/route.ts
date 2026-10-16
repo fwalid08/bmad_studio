@@ -10,6 +10,8 @@ import type { EventSubscribeOutput } from "@opencode/client";
 interface StreamBody {
   directory: string;
   sessionId?: string;
+  /** Reconnect to an active session without sending another prompt. */
+  resumeOnly?: boolean;
   /** The high-level goal/instructions for the build. */
   prompt: string;
   /** Model id in "providerID/modelID" form. */
@@ -56,7 +58,7 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  if (!body.directory || !body.prompt?.trim()) {
+  if (!body.directory || (!body.resumeOnly && !body.prompt?.trim()) || (body.resumeOnly && !body.sessionId)) {
     return NextResponse.json({ error: "Missing directory or prompt" }, { status: 400 });
   }
 
@@ -77,7 +79,7 @@ export async function POST(req: Request) {
       const client = await clientFor();
 
       const sm = body.model ? splitModel(body.model) : undefined;
-      const sessionId = await ensureSession(client.session, {
+      const sessionId = body.resumeOnly ? body.sessionId! : await ensureSession(client.session, {
         directory: body.directory,
         sessionId: body.sessionId,
         title: body.title ?? "BMAD Build",
@@ -93,8 +95,7 @@ export async function POST(req: Request) {
         // Keep the build running if usage history is unavailable.
       }
 
-      // Tear down the event loop when the client disconnects (user clicked Stop)
-      // or when the halt watchdog fires.
+      // Tear down the event loop when the session becomes idle or the halt watchdog fires.
       const loopAbort = new AbortController();
       let haltTimer: ReturnType<typeof setTimeout> | undefined;
       let terminalOutcome: TerminalOutcome | undefined;
@@ -121,34 +122,78 @@ export async function POST(req: Request) {
           loopAbort.abort();
         }, haltTimeoutMs());
       };
-
-      req.signal.addEventListener("abort", () => {
-        clearHaltTimer();
-        // Interrupt the running OpenCode session, then stop the event loop.
-        client.session.interrupt({ sessionID: sessionId }).catch(() => {});
-        loopAbort.abort();
-      });
+      const surfacedHaltIds = new Set<string>();
+      const handleHalt = async (halt: HaltRequest) => {
+        if (surfacedHaltIds.has(halt.id)) return;
+        surfacedHaltIds.add(halt.id);
+        if (halt.kind === "permission" && autoApprovePermissions()) {
+          await client.permission
+            .reply({ sessionID: sessionId, requestID: halt.id, decision: "once" })
+            .catch(() => {});
+          emit({ kind: "info", title: `✔ Izin disetujui otomatis: ${halt.title}` });
+          return;
+        }
+        emit({
+          kind: "halt",
+          title: halt.title,
+          detail: halt.message ?? halt.resources?.join("\n"),
+        });
+        send("halt", halt);
+        armHaltTimer(halt);
+      };
 
       // Subscribe BEFORE prompting so we don't miss early events.
       const eventStream = client.event.subscribe({ signal: loopAbort.signal });
 
-      // Fire the prompt asynchronously; completion is driven by the event loop.
-      // Agent/model switch first when provided (session may pre-exist).
-      if (body.agent) {
-        await client.session.switchAgent({ sessionID: sessionId, agent: body.agent }).catch(() => {});
-      }
-      if (body.model) {
-        const m = splitModel(body.model);
-        await client.session
-          .switchModel({ sessionID: sessionId, model: { id: m.modelID, providerID: m.providerID } })
-          .catch(() => {});
-      }
-      void client.session
-        .prompt({ sessionID: sessionId, text: body.prompt })
-        .catch((err: unknown) => {
-          terminalOutcome = { kind: "error", message: err instanceof Error ? err.message : String(err) };
+      if (body.resumeOnly) {
+        const [pendingPermissions, pendingForms] = await Promise.all([
+          client.permission.list({ sessionID: sessionId }).catch(() => []),
+          client.session.form.list({ sessionID: sessionId }).catch(() => []),
+        ]);
+        for (const permission of pendingPermissions) {
+          const halt = mapper.haltRequest(
+            { type: "permission.asked", data: permission } as EventSubscribeOutput,
+            sessionId
+          );
+          if (halt) await handleHalt(halt);
+        }
+        for (const form of pendingForms) {
+          const halt = mapper.haltRequest(
+            { type: "form.created", data: { form } } as EventSubscribeOutput,
+            sessionId
+          );
+          if (halt) await handleHalt(halt);
+        }
+        // The reconnect may miss a terminal event emitted while subscribing.
+        // Waiting for idle also handles sessions that finished just before attach.
+        void client.session.wait({ sessionID: sessionId }).then(() => {
+          if (terminalOutcome) return;
+          terminalOutcome = { kind: "success" };
+          loopAbort.abort();
+        }).catch((error: unknown) => {
+          if (terminalOutcome) return;
+          terminalOutcome = { kind: "error", message: error instanceof Error ? error.message : String(error) };
           loopAbort.abort();
         });
+      } else {
+        // Fire the prompt asynchronously; completion is driven by the event loop.
+        // Agent/model switch first when provided (session may pre-exist).
+        if (body.agent) {
+          await client.session.switchAgent({ sessionID: sessionId, agent: body.agent }).catch(() => {});
+        }
+        if (body.model) {
+          const m = splitModel(body.model);
+          await client.session
+            .switchModel({ sessionID: sessionId, model: { id: m.modelID, providerID: m.providerID } })
+            .catch(() => {});
+        }
+        void client.session
+          .prompt({ sessionID: sessionId, text: body.prompt })
+          .catch((err: unknown) => {
+            terminalOutcome = { kind: "error", message: err instanceof Error ? err.message : String(err) };
+            loopAbort.abort();
+          });
+      }
 
       try {
         try {
@@ -160,20 +205,7 @@ export async function POST(req: Request) {
             // Human-decision halts: surface to the UI (and auto-approve permissions).
             const halt = mapper.haltRequest(event, sessionId);
             if (halt) {
-              if (halt.kind === "permission" && autoApprovePermissions()) {
-                await client.permission
-                  .reply({ sessionID: sessionId, requestID: halt.id, decision: "once" })
-                  .catch(() => {});
-                emit({ kind: "info", title: `✔ Izin disetujui otomatis: ${halt.title}` });
-              } else {
-                emit({
-                  kind: "halt",
-                  title: halt.title,
-                  detail: halt.message ?? halt.resources?.join("\n"),
-                });
-                send("halt", halt);
-                armHaltTimer(halt);
-              }
+              await handleHalt(halt);
               continue;
             }
 
@@ -206,10 +238,10 @@ export async function POST(req: Request) {
           }
         }
 
-        if (!req.signal.aborted) {
-          if (!terminalOutcome) {
-            terminalOutcome = { kind: "error", message: "OpenCode run berakhir tanpa status terminal." };
-          }
+        if (!terminalOutcome && !body.resumeOnly) {
+          terminalOutcome = { kind: "error", message: "OpenCode run berakhir tanpa status terminal." };
+        }
+        if (terminalOutcome) {
           let usage;
           if (previousMessageIds) {
             try {

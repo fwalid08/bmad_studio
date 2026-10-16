@@ -62,6 +62,18 @@ export const opencode = {
       `/api/opencode/sessions?directory=${encodeURIComponent(directory)}`
     ),
 
+  /** Check whether a session still has an active OpenCode run. */
+  sessionActive: (directory: string, sessionId: string) =>
+    json<{ active: boolean }>(
+      `/api/opencode/sessions?directory=${encodeURIComponent(directory)}&sessionId=${encodeURIComponent(sessionId)}`
+    ),
+
+  /** List all session IDs currently running on the OpenCode server. */
+  activeSessions: (directory: string) =>
+    json<{ activeSessionIds: string[] }>(
+      `/api/opencode/sessions?directory=${encodeURIComponent(directory)}&includeActive=true`
+    ),
+
   /** Delete a session from the OpenCode project directory. */
   deleteSession: (directory: string, sessionId: string) =>
     json<{ ok: true }>(
@@ -112,6 +124,10 @@ export const opencode = {
     id: string;
     answer: Record<string, string | number | boolean | string[]>;
   }) => post<{ ok: true }>("/api/opencode/halt", { ...input, kind: "form" }),
+
+  /** Interrupt an active build or review without closing its event stream. */
+  interruptRun: (sessionId: string) =>
+    post<{ ok: true }>("/api/opencode/halt", { sessionId, kind: "interrupt" }),
 };
 
 /** Flatten providers into a single list of selectable model options. */

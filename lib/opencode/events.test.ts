@@ -57,3 +57,53 @@ test("does not substitute the word tool when the tool name is unavailable", () =
   assert.equal(result[0]?.title, "✔ Hasil");
   assert.equal(result[0]?.detail, "actual response");
 });
+
+test("restores a pending permission halt from session state", () => {
+  const mapper = new ActivityMapper();
+  const halt = mapper.haltRequest(
+    event("permission.asked", {
+      id: "permission-1",
+      sessionID: "session-1",
+      action: "bash",
+      resources: ["npm test"],
+    }),
+    "session-1"
+  );
+
+  assert.deepEqual(halt, {
+    id: "permission-1",
+    kind: "permission",
+    title: "Menunggu izin: bash",
+    message: undefined,
+    resources: ["npm test"],
+  });
+});
+
+test("restores a pending form halt with normalized fields", () => {
+  const mapper = new ActivityMapper();
+  const halt = mapper.haltRequest(
+    event("form.created", {
+      form: {
+        id: "form-1",
+        sessionID: "session-1",
+        title: "Choose a version",
+        fields: [{ key: "version", type: "string", required: true, options: [{ value: "v1", label: "Version 1" }] }],
+      },
+    }),
+    "session-1"
+  );
+
+  assert.deepEqual(halt, {
+    id: "form-1",
+    kind: "form",
+    title: "Choose a version",
+    fields: [{
+      key: "version",
+      type: "string",
+      title: undefined,
+      description: undefined,
+      required: true,
+      options: [{ value: "v1", label: "Version 1" }],
+    }],
+  });
+});

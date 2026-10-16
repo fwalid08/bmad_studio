@@ -4,7 +4,7 @@ import { clientFor } from "@/lib/opencode/server";
 interface HaltBody {
   sessionId: string;
   /** "permission" (tool approval) or "form" (agent question). */
-  kind: "permission" | "form";
+  kind: "permission" | "form" | "interrupt";
   /** Permission request id, or form id. */
   id: string;
   /** Permission decision. */
@@ -25,13 +25,15 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  if (!body.sessionId || !body.id || !body.kind) {
+  if (!body.sessionId || !body.kind || (body.kind !== "interrupt" && !body.id)) {
     return NextResponse.json({ error: "Missing sessionId, id or kind" }, { status: 400 });
   }
 
   try {
     const client = await clientFor();
-    if (body.kind === "permission") {
+    if (body.kind === "interrupt") {
+      await client.session.interrupt({ sessionID: body.sessionId });
+    } else if (body.kind === "permission") {
       await client.permission.reply({
         sessionID: body.sessionId,
         requestID: body.id,
