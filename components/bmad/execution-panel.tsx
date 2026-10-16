@@ -1,6 +1,6 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Rocket, Square, Loader2, ChevronLeft, ChevronRight, Pencil, Trash2, Wand2, FolderX, KanbanSquare, Sparkles, X, Check, ArrowRight, List, Search, CalendarDays, Maximize2, Minimize2, Archive, RotateCcw } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plus, Rocket, Square, Loader2, ChevronLeft, ChevronRight, Pencil, Trash2, Wand2, FolderX, KanbanSquare, Sparkles, X, Check, ArrowRight, List, Search, CalendarDays, Maximize2, Minimize2, Archive, RotateCcw, Bug } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -56,6 +56,13 @@ function artifactContext(project: Project): string {
 
 const PRIORITY_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
 const PRIORITY_LABEL: Record<string, string> = { high: "P1 · Duluan", medium: "P2", low: "P3" };
+const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
+  backlog: "Backlog",
+  todo: "Sprint",
+  "in-progress": "Dikerjakan",
+  review: "Review",
+  done: "Selesai",
+};
 
 function sortTasks<T extends { priority?: string; createdAt: string }>(list: T[]): T[] {
   return [...list].sort((a, b) => (PRIORITY_ORDER[a.priority ?? "medium"] ?? 1) - (PRIORITY_ORDER[b.priority ?? "medium"] ?? 1) || a.createdAt.localeCompare(b.createdAt));
@@ -63,6 +70,25 @@ function sortTasks<T extends { priority?: string; createdAt: string }>(list: T[]
 
 function parseTagInput(v: string): string[] {
   return [...new Set(v.split(/[,#\n]/).map((t) => t.trim().replace(/^#/, "").toLowerCase()).filter(Boolean))].slice(0, 10);
+}
+
+type BugReport = { steps: string; actual: string; expected: string; environment: string };
+
+function parseBugReport(detail: string): BugReport {
+  const empty: BugReport = { steps: "", actual: "", expected: "", environment: "" };
+  if (!detail.startsWith("[BUG REPORT]\n")) return { ...empty, actual: detail };
+  const sections = detail.slice("[BUG REPORT]\n".length).split(/\n\n(?=(?:Steps|Actual|Expected|Environment):\n)/);
+  for (const section of sections) {
+    const match = section.match(/^(Steps|Actual|Expected|Environment):\n([\s\S]*)$/);
+    if (!match) continue;
+    const key = { Steps: "steps", Actual: "actual", Expected: "expected", Environment: "environment" }[match[1]] as keyof BugReport;
+    empty[key] = match[2].trim();
+  }
+  return empty;
+}
+
+function formatBugReport(report: BugReport): string {
+  return `[BUG REPORT]\nSteps:\n${report.steps.trim()}\n\nActual:\n${report.actual.trim()}\n\nExpected:\n${report.expected.trim()}\n\nEnvironment:\n${report.environment.trim()}`;
 }
 
 /** Ambil kandidat objek JSON dari teks: code fence dulu, lalu scan brace seimbang. */
@@ -222,6 +248,23 @@ function extractFiles(events: ActivityEvent[]): string[] {
 
 const NO_TASK_KEY = "__none__";
 
+interface ActiveTaskRun {
+  kind: "build" | "review";
+  runId: string;
+  startedAtMs: number;
+  elapsedSec: number;
+  sessionId?: string;
+  halt?: HaltRequest;
+}
+
+interface TaskRunContext {
+  kind: "build" | "review";
+  runId: string;
+  sessionId?: string;
+  pendingInterrupt: boolean;
+  stopRequested: boolean;
+}
+
 /** Parse output elaborasi agen menjadi daftar story. Dukung JSON array atau list markdown. */
 function parseStories(text: string, fallbackEpic: string): Array<{ title: string; detail: string; epic: string }> {  // Cari blok JSON array di dalam teks (termasuk dalam code fence).
   const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -252,8 +295,136 @@ function parseStories(text: string, fallbackEpic: string): Array<{ title: string
   return out;
 }
 
+/** Kartu task kanban — dipakai ulang di strip Backlog horizontal & grid board.
+ *  fixedHeight=true hanya untuk strip Backlog (flex stretch horizontal);
+ *  kolom board pakai tinggi natural ngikutin konten. */
+function TaskCard({
+  t,
+  selected,
+  fixedHeight = false,
+  running = null,
+  runningElapsedSec = 0,
+  awaitingHalt = false,
+  onOpen,
+  onEdit,
+  onArchive,
+  onDelete,
+  onCyclePriority,
+  onSetStatus,
+  onMove,
+}: {
+  t: ExecTask;
+  selected: boolean;
+  fixedHeight?: boolean;
+  /** "build"/"review" saat task ini sedang diproses — tampilkan indikator loading di papan walau modal tertutup. */
+  running?: "build" | "review" | null;
+  runningElapsedSec?: number;
+  awaitingHalt?: boolean;
+  onOpen: (t: ExecTask) => void;
+  onEdit: (t: ExecTask) => void;
+  onArchive: (taskId: string) => void;
+  onDelete: (taskId: string) => void;
+  onCyclePriority: (t: ExecTask) => void;
+  onSetStatus: (t: ExecTask, status: TaskStatus) => void;
+  onMove: (t: ExecTask, dir: -1 | 1) => void;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpen(t)}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen(t);
+        }
+      }}
+      className={`${fixedHeight ? "flex h-full min-h-[172px] flex-col" : ""} cursor-pointer rounded-lg border px-2 py-1.5 text-left transition-colors hover:bg-accent ${running ? (running === "review" ? "border-sky-500/60 ring-2 ring-sky-500/30" : "border-emerald-500/60 ring-2 ring-emerald-500/30") : selected ? "border-primary/50 bg-accent" : "bg-card"}`}
+    >
+      <div className="flex items-center gap-1.5">
+        <p className="min-w-0 flex-1 truncate text-xs font-semibold">{t.title}</p>
+        <button
+          type="button"
+          title="Klik untuk ganti prioritas"
+          disabled={t.status === "done"}
+          onClick={(e) => {
+            e.stopPropagation();
+            onCyclePriority(t);
+          }}
+          className={`shrink-0 rounded px-1 py-0.5 text-[10px] font-bold ${(t.priority ?? "medium") === "high" ? "bg-red-500/15 text-red-600 dark:text-red-400" : (t.priority ?? "medium") === "low" ? "bg-muted text-muted-foreground" : "bg-amber-500/15 text-amber-700 dark:text-amber-400"}`}
+        >
+          {PRIORITY_LABEL[t.priority ?? "medium"]}
+        </button>
+      </div>
+      {running ? (
+        <div className={`mt-1.5 flex items-center gap-1.5 rounded-md border px-1.5 py-1 text-[10px] font-medium ${running === "review" ? "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300" : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"}`}>
+          <Loader2 className="size-3 shrink-0 animate-spin" />
+          <span className="truncate">{running === "review" ? "Review berjalan" : "Build berjalan"}{runningElapsedSec > 0 ? ` · ${Math.floor(runningElapsedSec / 60)}:${String(runningElapsedSec % 60).padStart(2, "0")}` : ""}{awaitingHalt ? " · butuh keputusan" : ""}</span>
+        </div>
+      ) : null}
+      {t.epic ? (
+        <p className={`text-muted-foreground truncate text-[11px]${fixedHeight ? " h-[15px]" : ""}`}>{t.epic}</p>
+      ) : fixedHeight ? (
+        <p className="h-[15px] text-[11px]">&nbsp;</p>
+      ) : null}
+      {(t.tags ?? []).length > 0 ? (
+        <div className={`mt-0.5 flex flex-wrap gap-1${fixedHeight ? " h-[20px] overflow-hidden" : ""}`}>
+          {(t.tags ?? []).slice(0, 4).map((tag) => (
+            <Badge key={tag} variant="outline" className="px-1 py-0 text-[10px]">#{tag}</Badge>
+          ))}
+        </div>
+      ) : fixedHeight ? (
+        <div className="mt-0.5 h-[20px]" />
+      ) : null}
+      {t.detail ? (
+        <p className={`text-muted-foreground mt-0.5 text-[11px]${fixedHeight ? " line-clamp-2 min-h-[28px]" : " line-clamp-1"}`}>{t.detail}</p>
+      ) : fixedHeight ? (
+        <p className="mt-0.5 min-h-[28px] text-[11px]">&nbsp;</p>
+      ) : null}
+      {t.sessionId ? (
+        <p className={`text-emerald-600 dark:text-emerald-400 mt-0.5 flex items-center gap-1 text-[10px] font-medium${fixedHeight ? " h-[15px]" : ""}`}>
+          <span className="size-1.5 rounded-full bg-emerald-500" /> Session terisolasi
+        </p>
+      ) : fixedHeight ? (
+        <p className="mt-0.5 h-[15px] text-[10px]">&nbsp;</p>
+      ) : null}
+      {(t.builds ?? [])[0] ? (
+        <p className={`text-muted-foreground mt-0.5 truncate text-[10px] tabular-nums${fixedHeight ? " h-[14px]" : ""}`}>
+          {(t.builds ?? [])[0].status === "done" ? "✔" : (t.builds ?? [])[0].status === "error" ? "✖" : "■"} build {formatElapsed((t.builds ?? [])[0].elapsedMs)}{(t.builds ?? [])[0].files.length > 0 ? ` · ${(t.builds ?? [])[0].files.length} file` : ""}
+        </p>
+      ) : fixedHeight ? (
+        <p className="mt-0.5 h-[14px] text-[10px]">&nbsp;</p>
+      ) : null}
+      <div className={`${fixedHeight ? "mt-auto pt-1" : "mt-1"} flex items-center gap-0.5`}>
+        {t.status === "done" && (
+          <Button size="sm" variant="outline" className="h-6 gap-1 px-2 text-[10px]" onClick={(e) => { e.stopPropagation(); onSetStatus(t, "review"); }}>
+            <RotateCcw className="size-3" /> Buka kembali
+          </Button>
+        )}
+        <span className="flex-1" />
+        <Button size="icon" variant="ghost" className="size-6" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); onEdit(t); }}><Pencil className="size-3.5" /></Button>
+        <Button size="icon" variant="ghost" className="size-6" title="Arsipkan task" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); onArchive(t.id); }}><Archive className="size-3.5" /></Button>
+        <Button size="icon" variant="ghost" className="size-6 text-destructive" title="Pindahkan ke sampah" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); onDelete(t.id); }}><Trash2 className="size-3.5" /></Button>
+      </div>
+      <div className="mt-1 flex items-center justify-between rounded-md bg-muted/70 px-1.5 py-1">
+        <span className="text-muted-foreground text-[10px]">Ganti status</span>
+        <div className="flex items-center gap-1">
+          <Button size="icon" variant="outline" className="size-6 bg-background" aria-label="Pindah ke status sebelumnya" title="Pindah ke status sebelumnya" disabled={t.status === "done" || COLUMNS[0].id === t.status} onClick={(e) => { e.stopPropagation(); onMove(t, -1); }}><ChevronLeft className="size-3.5" /></Button>
+          <Button size="icon" variant="outline" className="size-6 bg-background" aria-label="Pindah ke status berikutnya" title="Pindah ke status berikutnya" disabled={t.status === "done" || COLUMNS[COLUMNS.length - 1].id === t.status} onClick={(e) => { e.stopPropagation(); onMove(t, 1); }}><ChevronRight className="size-3.5" /></Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Kolom board selain Backlog (Backlog dirender sebagai strip horizontal di atas). */
+const BOARD_COLUMNS = COLUMNS.slice(1);
+
+
 export function ExecutionPanel({ project }: { project: Project }) {
   const notify = useNotifications();
+  const projectsLoaded = useStudio((s) => s.projectsLoaded);
   const settings = useStudio((s) => s.settings);
   const updateSettings = useStudio((s) => s.updateSettings);
   const setProjectSession = useStudio((s) => s.setProjectSession);
@@ -279,9 +450,14 @@ export function ExecutionPanel({ project }: { project: Project }) {
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<ExecTask | null>(null);
+  const [dialogKind, setDialogKind] = useState<"task" | "bug">("task");
   const [fTitle, setFTitle] = useState("");
   const [fEpic, setFEpic] = useState("");
   const [fDetail, setFDetail] = useState("");
+  const [fBugSteps, setFBugSteps] = useState("");
+  const [fBugActual, setFBugActual] = useState("");
+  const [fBugExpected, setFBugExpected] = useState("");
+  const [fBugEnvironment, setFBugEnvironment] = useState("");
   const [fTags, setFTags] = useState("");
   const [fPriority, setFPriority] = useState<TaskPriority>("medium");
   const [fStatus, setFStatus] = useState<TaskStatus>("backlog");
@@ -339,7 +515,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
   }
 
   async function handleBreakdown() {
-    if (breakdownBusy || busy) return;
+    if (breakdownBusy || Object.values(activeRuns).some((run) => run.kind === "build")) return;
     if (!hasAnyArtifact) {
       notify({ kind: "error", title: "Belum ada artefak", description: "Isi tab Rencana dulu (PRD / arsitektur / epics) sebelum breakdown." });
       return;
@@ -427,67 +603,312 @@ export function ExecutionPanel({ project }: { project: Project }) {
   // Build dialog (form build + info task terpilih)
   const [buildDialogOpen, setBuildDialogOpen] = useState(false);
   const [buildFullscreen, setBuildFullscreen] = useState(false);
-  const [buildDetailsTab, setBuildDetailsTab] = useState<"history" | "activity" | "review">("history");
+  const [buildDetailsTab, setBuildDetailsTab] = useState<"info" | "history" | "activity" | "review">("info");
   const [runMode, setRunMode] = useState<"build" | "review">("build");
   const [activityMode, setActivityMode] = useState<"build" | "review">("build");
 
   // Build runner (per selected task, konteks artefak otomatis)
   const [goalOverride, setGoalOverride] = useState<string | null>(null);
   const [models, setModels] = useState<ReturnType<typeof flattenModels>>([]);
-  const [busy, setBusy] = useState(false);
-  const [reviewing, setReviewing] = useState(false);
+  const [activeRuns, setActiveRuns] = useState<Record<string, ActiveTaskRun>>({});
+  const activeRunsRef = useRef<Record<string, ActiveTaskRun>>({});
+  const runContextsRef = useRef<Record<string, TaskRunContext>>({});
+  const selectedIdRef = useRef(selectedId);
   const [reviewError, setReviewError] = useState<string | null>(null);
-  const activeReviewRunRef = useRef<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(project.sessionId ?? null);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const reviewAbortRef = useRef<AbortController | null>(null);
+  const recoveredRunsRef = useRef(new Set<string>());
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [lastDoneAt, setLastDoneAt] = useState<string | null>(null);
-  const [elapsedSec, setElapsedSec] = useState(0);
-  // A pending human decision (tool permission or agent question) blocks the build.
-  const [halt, setHalt] = useState<HaltRequest | null>(null);
-  const [answeringHalt, setAnsweringHalt] = useState(false);
-  const activeSessionRef = useRef<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  const [answeringHaltByTask, setAnsweringHaltByTask] = useState<Record<string, boolean>>({});
   // Log per task disimpan di memori sesi agar tidak hilang saat ganti seleksi;
   // ringkasannya (status, durasi, file) dipersist ke store saat build selesai.
   const logsRef = useRef(new Map<string, ActivityEvent[]>());
-  const buildTaskRef = useRef<string | null>(null);
-  const buildStartRef = useRef(0);
-  const buildStatusRef = useRef<"running" | "done" | "error" | "stopped" | "interrupted">("running");
-  const buildStatusMessageRef = useRef<string | undefined>(undefined);
-  const buildCountRef = useRef(0);
-  const buildGoalRef = useRef("");
+  const selectedRunKey = selected?.id ?? NO_TASK_KEY;
+  const activeRunCount = Object.keys(activeRuns).length;
+  const selectedPersistedRun = selected?.builds?.find((build) => build.status === "running") ?? null;
+  const selectedRun = activeRuns[selectedRunKey] ?? null;
+  const busy = selectedRun?.kind === "build" || (!selectedRun && selectedPersistedRun?.mode !== "review" && selectedPersistedRun !== null);
+  const reviewing = selectedRun?.kind === "review" || (!selectedRun && selectedPersistedRun?.mode === "review");
+  const elapsedSec = selectedRun?.elapsedSec ?? 0;
+  const halt = selectedRun?.halt ?? null;
+  const answeringHalt = Boolean(answeringHaltByTask[selectedRunKey]);
+
+  const setTaskRun = useCallback((taskKey: string, run: ActiveTaskRun | null) => {
+    const next = { ...activeRunsRef.current };
+    if (run) next[taskKey] = run;
+    else delete next[taskKey];
+    activeRunsRef.current = next;
+    setActiveRuns(next);
+  }, []);
+
+  const patchTaskRun = useCallback((taskKey: string, runId: string, patch: Partial<ActiveTaskRun>) => {
+    const current = activeRunsRef.current[taskKey];
+    if (!current || current.runId !== runId) return;
+    setTaskRun(taskKey, { ...current, ...patch });
+  }, [setTaskRun]);
+
+  const finishTaskRun = useCallback((taskKey: string, runId: string) => {
+    if (activeRunsRef.current[taskKey]?.runId === runId) setTaskRun(taskKey, null);
+    if (runContextsRef.current[taskKey]?.runId === runId) delete runContextsRef.current[taskKey];
+  }, [setTaskRun]);
+
+  const updateTaskEvents = useCallback((taskKey: string, update: ActivityEvent[] | ((current: ActivityEvent[]) => ActivityEvent[])) => {
+    const current = logsRef.current.get(taskKey) ?? [];
+    const next = typeof update === "function" ? update(current) : update;
+    logsRef.current.set(taskKey, next);
+    if ((selectedIdRef.current ?? NO_TASK_KEY) === taskKey) setEvents(next);
+  }, []);
+
   const ready = Boolean(project.directory);
   const displayedSessionId = selected
     ? selected.sessionId ?? currentSessionId
     : currentSessionId ?? project.sessionId;
 
   function selectTask(id: string | null) {
-    if ((busy || reviewing) && id !== selectedId) return;
     if (selectedId) logsRef.current.set(selectedId, events);
     if (id === NO_TASK_KEY) id = null;
+    selectedIdRef.current = id;
     setSelectedId(id);
     setGoalOverride(null);
+    // Teks "Selesai ..." dari task sebelumnya tidak boleh muncul di task baru.
+    setLastDoneAt(null);
     setEvents(id ? (logsRef.current.get(id) ?? []) : (logsRef.current.get(NO_TASK_KEY) ?? []));
-    if (!busy && !reviewing) {
-      const taskSessionId = id ? tasks.find((task) => task.id === id)?.sessionId ?? null : project.sessionId ?? null;
-      activeSessionRef.current = taskSessionId;
-      setCurrentSessionId(taskSessionId);
+    setError(null);
+    setReviewError(null);
+    const task = id ? tasks.find((item) => item.id === id) : null;
+    const taskSessionId = (id ? activeRunsRef.current[id]?.sessionId : undefined) ?? task?.sessionId ?? project.sessionId ?? null;
+    setCurrentSessionId(taskSessionId);
+    const activeRun = id ? activeRunsRef.current[id] : undefined;
+    if (activeRun) {
+      setActivityMode(activeRun.kind);
+      setBuildDetailsTab("activity");
     }
   }
 
-  // Ticker elapsed time selama build berjalan.
+  // Ticker elapsed time selama build / review berjalan (dipakai modal + badge kartu).
   useEffect(() => {
-    if (!busy) return;
-    const t = setInterval(() => setElapsedSec(Math.floor((Date.now() - buildStartRef.current) / 1000)), 1000);
+    if (activeRunCount === 0) return;
+    const t = setInterval(() => {
+      const now = Date.now();
+      setActiveRuns((previous) => {
+        const next = Object.fromEntries(Object.entries(previous).map(([taskKey, run]) => [
+          taskKey,
+          { ...run, elapsedSec: Math.max(0, Math.floor((now - run.startedAtMs) / 1000)) },
+        ]));
+        activeRunsRef.current = next;
+        return next;
+      });
+    }, 1000);
     return () => clearInterval(t);
-  }, [busy]);
+  }, [activeRunCount]);
+
+  useEffect(() => {
+    if (!projectsLoaded) return;
+    void (async () => {
+      let activeSessionIds = new Set<string>();
+      try {
+        const active = await opencode.activeSessions(project.directory);
+        activeSessionIds = new Set(active.activeSessionIds);
+      } catch { /* Persisted running records are still reattached below. */ }
+
+      const candidates = tasks.flatMap((task) => {
+        const builds = task.builds ?? [];
+        return builds.filter((build) => {
+          const sessionId = build.sessionId ?? task.sessionId ?? project.sessionId;
+          if (build.status === "running") return true;
+          if (!sessionId || !activeSessionIds.has(sessionId) || !["error", "interrupted", "stopped"].includes(build.status)) return false;
+          return !builds.some((newer) => {
+            const newerSessionId = newer.sessionId ?? task.sessionId ?? project.sessionId;
+            return newerSessionId === sessionId && Date.parse(newer.startedAt) > Date.parse(build.startedAt);
+          });
+        }).map((build) => ({ task, build }));
+      }).sort((a, b) => Date.parse(b.build.startedAt) - Date.parse(a.build.startedAt));
+      const claimedSessions = new Set<string>();
+
+      for (const { task, build } of candidates) {
+      const taskKey = task.id;
+      if (recoveredRunsRef.current.has(build.id) || activeRunsRef.current[taskKey]) continue;
+      const candidateSessionId = build.sessionId ?? task.sessionId ?? project.sessionId;
+      if (candidateSessionId && claimedSessions.has(candidateSessionId)) continue;
+      if (candidateSessionId) claimedSessions.add(candidateSessionId);
+      recoveredRunsRef.current.add(build.id);
+      void (async () => {
+        const mode = build.mode === "review" ? "review" : "build";
+        const startedAtMs = Date.parse(build.startedAt) || Date.now();
+        let sessionId = build.sessionId ?? task.sessionId ?? project.sessionId;
+        if (!sessionId) {
+          setTaskRun(taskKey, { kind: mode, runId: build.id, startedAtMs, elapsedSec: Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)) });
+          const expectedTitle = mode === "review" ? `Implementation review — ${task.title}` : `${project.name} — Build ${task.title}`;
+          for (let attempt = 0; attempt < 20 && !sessionId; attempt += 1) {
+            try {
+              const { sessions } = await opencode.sessions(project.directory);
+              sessionId = sessions.find((session) => session.title === expectedTitle)?.id;
+            } catch { /* Retry while the session list catches up. */ }
+            if (!sessionId) await new Promise((resolve) => setTimeout(resolve, 1500));
+          }
+        }
+        if (!sessionId) {
+          const finishedAt = new Date().toISOString();
+          const current = useStudio.getState().getProject(project.id)?.tasks?.find((item) => item.id === task.id);
+          updateTask(project.id, task.id, {
+            builds: (current?.builds ?? task.builds ?? []).map((item) => item.id === build.id
+              ? { ...item, status: "error", statusMessage: "Session OpenCode belum ditemukan; run tidak ditandai terinterupsi.", finishedAt }
+              : item),
+          });
+          finishTaskRun(taskKey, build.id);
+          return;
+        }
+
+        if (build.status !== "running") {
+          const current = useStudio.getState().getProject(project.id)?.tasks?.find((item) => item.id === task.id);
+          updateTask(project.id, task.id, {
+            builds: (current?.builds ?? task.builds ?? []).map((item) => item.id === build.id
+              ? { ...item, status: "running", finishedAt: undefined, statusMessage: undefined }
+              : item),
+          });
+        }
+
+        const context: TaskRunContext = { kind: mode, runId: build.id, sessionId, pendingInterrupt: false, stopRequested: false };
+        runContextsRef.current[taskKey] = context;
+        setTaskRun(taskKey, {
+          kind: mode,
+          runId: build.id,
+          startedAtMs,
+          elapsedSec: Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)),
+          sessionId,
+        });
+        updateTaskEvents(taskKey, [{ kind: "info", title: `Menyambungkan kembali — ${task.title}`, detail: `Session: ${sessionId}` }]);
+        if (selectedIdRef.current === task.id) {
+          setCurrentSessionId(sessionId);
+          setActivityMode(mode);
+          setBuildDetailsTab("activity");
+        }
+
+        let status: TaskBuild["status"] = "running";
+        let summary: string | undefined;
+        let statusMessage: string | undefined;
+        let usage: TokenUsage | undefined;
+        try {
+          let statusCheckFailures = 0;
+          while (status === "running") {
+            const response = await fetch("/api/opencode/stream", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ directory: project.directory, sessionId, resumeOnly: true }),
+            });
+            if (!response.ok || !response.body) {
+              const data = (await response.json().catch(() => ({}))) as { error?: string };
+              throw new Error(data.error ?? `Request failed (${response.status})`);
+            }
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const chunks = buffer.split("\n\n");
+              buffer = chunks.pop() ?? "";
+              for (const chunk of chunks) {
+                let eventName = "message";
+                let dataStr = "";
+                for (const line of chunk.split("\n")) {
+                  if (line.startsWith("event:")) eventName = line.slice(6).trim();
+                  else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+                }
+                if (!dataStr) continue;
+                let payload: unknown;
+                try { payload = JSON.parse(dataStr); } catch { continue; }
+                if (eventName === "log") updateTaskEvents(taskKey, (previous) => [...previous, payload as ActivityEvent]);
+                else if (eventName === "halt") patchTaskRun(taskKey, build.id, { halt: payload as HaltRequest });
+                else if (eventName === "halt_resolved") patchTaskRun(taskKey, build.id, { halt: undefined });
+                else if (eventName === "done") {
+                  status = "done";
+                  const result = payload as { summary?: unknown; usage?: TokenUsage };
+                  summary = typeof result.summary === "string" ? result.summary.trim() || undefined : undefined;
+                  usage = result.usage;
+                } else if (eventName === "error") {
+                  status = "error";
+                  const result = payload as { message?: string; usage?: TokenUsage };
+                  statusMessage = result.message ?? "Run gagal setelah tersambung kembali.";
+                  usage = result.usage;
+                } else if (eventName === "interrupted") {
+                  status = context.stopRequested ? "stopped" : "interrupted";
+                  statusMessage = context.stopRequested ? "Run dihentikan melalui tombol Stop." : interruptionStatusMessage((payload as { reason?: string }).reason);
+                  usage = (payload as { usage?: TokenUsage }).usage;
+                }
+              }
+            }
+            if (status !== "running") break;
+
+            try {
+              const sessionState = await opencode.sessionActive(project.directory, sessionId);
+              statusCheckFailures = 0;
+              if (sessionState.active) {
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+                continue;
+              }
+              status = "interrupted";
+              statusMessage = "OpenCode melaporkan session tidak aktif tanpa status akhir run.";
+            } catch {
+              statusCheckFailures += 1;
+              const retryDelayMs = Math.min(10000, 1500 * 2 ** Math.min(statusCheckFailures - 1, 3));
+              await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+            }
+          }
+        } catch (failure) {
+          status = context.stopRequested ? "stopped" : "error";
+          statusMessage = failure instanceof Error ? failure.message : "Gagal menyambungkan kembali ke OpenCode.";
+        }
+
+        const finishedAt = new Date();
+        const current = useStudio.getState().getProject(project.id)?.tasks?.find((item) => item.id === task.id);
+        const currentBuild = current?.builds?.find((item) => item.id === build.id) ?? build;
+        let reviewPatch: TaskImplementationReview | undefined;
+        if (status === "done") {
+          try {
+            const result = await opencode.messages(project.directory, sessionId);
+            let lastUserIndex = -1;
+            result.messages.forEach((message, index) => { if (message.role === "user") lastUserIndex = index; });
+            const latestText = result.messages.slice(lastUserIndex + 1)
+              .filter((message) => message.role === "assistant" && message.text.trim())
+              .map((message) => message.text.trim())
+              .join("\n\n");
+            if (latestText && (mode === "review" || !summary)) summary = latestText.length > 12000 ? latestText.slice(-12000) : latestText;
+          } catch { /* Keep stream summary if session history is unavailable. */ }
+          if (mode === "review" && summary) {
+            reviewPatch = { verdict: parseImplementationVerdict(summary), summary, reviewedAt: finishedAt.toISOString(), model: build.model, agent: build.agent };
+          }
+        }
+        const finalEvents = logsRef.current.get(taskKey) ?? [];
+        const updatedBuild: TaskBuild = {
+          ...currentBuild,
+          status,
+          summary: summary ?? currentBuild.summary,
+          usage: usage ?? currentBuild.usage,
+          statusMessage,
+          finishedAt: finishedAt.toISOString(),
+          elapsedMs: Math.max(0, finishedAt.getTime() - startedAtMs),
+          eventCount: finalEvents.length,
+          files: extractFiles(finalEvents),
+        };
+        updateTask(project.id, task.id, {
+          builds: [updatedBuild, ...(current?.builds ?? task.builds ?? []).filter((item) => item.id !== build.id)],
+          ...(reviewPatch ? { implementationReview: reviewPatch } : {}),
+          ...(mode === "build" && status === "done" && current?.status === "in-progress" ? { status: "review" } : {}),
+        });
+        finishTaskRun(taskKey, build.id);
+      })();
+      }
+    })();
+  }, [projectsLoaded, project.directory, project.id, project.name, project.sessionId, tasks, updateTask, finishTaskRun, patchTaskRun, setTaskRun, updateTaskEvents]);
 
   const goalText = (goalOverride ?? "").trim();
   const buildModel = settings.defaultModel ?? "";
   const latestBuild = selected?.builds?.[0];
+  const latestBuildRun = selected?.builds?.find((build) => (build.mode ?? "build") === "build");
   const cumulativeBuildDurationMs = (selected?.builds ?? []).reduce(
     (total, build) => total + (typeof build.elapsedMs === "number" ? build.elapsedMs : 0),
     0
@@ -509,7 +930,8 @@ export function ExecutionPanel({ project }: { project: Project }) {
     },
     { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0, runCount: 0, costUsd: 0, costRunCount: 0 }
   );
-  const canResumeBuild = latestBuild?.status === "error" || latestBuild?.status === "stopped" || latestBuild?.status === "interrupted";
+  const canResumeBuild = latestBuildRun?.status === "error" || latestBuildRun?.status === "stopped" || latestBuildRun?.status === "interrupted";
+  const hasBuildHistory = Boolean(latestBuildRun);
 
   useEffect(() => {
     let active = true;
@@ -533,6 +955,49 @@ export function ExecutionPanel({ project }: { project: Project }) {
   const visibleTasks = sortTasks(tagFilter ? tasks.filter((t) => (t.tags ?? []).includes(tagFilter)) : tasks);
   const nextUp = sortTasks(visibleTasks.filter((t) => t.status === "todo")).concat(sortTasks(visibleTasks.filter((t) => t.status === "backlog")))[0] ?? null;
 
+  // Strip Backlog horizontal di atas board.
+  const backlogRef = useRef<HTMLDivElement | null>(null);
+  const isBugFixTask = (task: ExecTask) => (task.tags ?? []).some((tag) => tag === "bug" || tag === "fix");
+  const backlogAll = useMemo(() => {
+    const base = tagFilter ? tasks.filter((t) => (t.tags ?? []).includes(tagFilter)) : tasks;
+    return sortTasks(base.filter((t) => t.status === "backlog" && !isBugFixTask(t)));
+  }, [tasks, tagFilter]);
+  const backlogItems = backlogAll.slice(0, BOARD_LIMIT);
+  const backlogRest = backlogAll.length - backlogItems.length;
+  const bugFixTasks = sortTasks(visibleTasks.filter((task) => task.status === "backlog" && isBugFixTask(task)));
+  function scrollBacklog(dir: -1 | 1) {
+    backlogRef.current?.scrollBy({ left: dir * 320, behavior: "smooth" });
+  }
+
+  // Handler kartu (dipakai ulang strip Backlog + grid board).
+  function cyclePriority(t: ExecTask) {
+    const order: TaskPriority[] = ["high", "medium", "low"];
+    const next = order[(order.indexOf(t.priority ?? "medium") + 1) % order.length];
+    updateTask(project.id, t.id, { priority: next });
+  }
+  function setTaskStatus(t: ExecTask, status: TaskStatus) {
+    updateTask(project.id, t.id, { status });
+  }
+  // Props indikator running untuk TaskCard — kartu task yang sedang di-build /
+  // di-review menampilkan spinner + elapsed walau modal build tertutup.
+  function runningPropsFor(taskId: string): { running: "build" | "review" | null; runningElapsedSec: number; awaitingHalt: boolean } {
+    const activeRun = activeRuns[taskId];
+    if (activeRun) return { running: activeRun.kind, runningElapsedSec: activeRun.elapsedSec, awaitingHalt: activeRun.kind === "build" && activeRun.halt !== undefined };
+    const task = tasks.find((item) => item.id === taskId);
+    const persistedRun = task?.builds?.find((build) => build.status === "running");
+    if (!persistedRun) return { running: null, runningElapsedSec: 0, awaitingHalt: false };
+    return { running: persistedRun.mode === "review" ? "review" : "build", runningElapsedSec: 0, awaitingHalt: false };
+  }
+  const cardHandlers = {
+    onOpen: openBuildDialog,
+    onEdit: openEdit,
+    onArchive: handleArchiveTask,
+    onDelete: handleDeleteTask,
+    onCyclePriority: cyclePriority,
+    onSetStatus: setTaskStatus,
+    onMove: move,
+  };
+
   function openList(status?: TaskStatus | "all", scope: "active" | "archived" | "deleted" = "active") {
     if (status !== undefined) setListStat(status);
     setListScope(scope);
@@ -554,19 +1019,36 @@ export function ExecutionPanel({ project }: { project: Project }) {
 
   function openNew() {
     setEditing(null);
+    setDialogKind("task");
     setFTitle("");
     setFEpic("");
     setFDetail("");
+    setFBugSteps("");
+    setFBugActual("");
+    setFBugExpected("");
+    setFBugEnvironment("");
     setFTags("");
     setFPriority("medium");
     setFStatus("backlog");
     setDialogOpen(true);
   }
+  function openNewBug() {
+    openNew();
+    setDialogKind("bug");
+    setFTags("bug");
+  }
   function openEdit(t: ExecTask) {
     setEditing(t);
+    const isBug = (t.tags ?? []).some((tag) => tag === "bug" || tag === "fix");
+    setDialogKind(isBug ? "bug" : "task");
     setFTitle(t.title);
     setFEpic(t.epic);
     setFDetail(t.detail);
+    const report = parseBugReport(t.detail);
+    setFBugSteps(report.steps);
+    setFBugActual(report.actual);
+    setFBugExpected(report.expected);
+    setFBugEnvironment(report.environment);
     setFTags((t.tags ?? []).join(", "));
     setFPriority(t.priority ?? "medium");
     setFStatus(t.status);
@@ -574,24 +1056,30 @@ export function ExecutionPanel({ project }: { project: Project }) {
   }
 
   function openBuildDialog(t: ExecTask) {
-    if ((busy || reviewing) && t.id !== selectedId) return;
+    // Buka dialog untuk task lain walau build/review lain sedang berjalan.
     selectTask(t.id);
-    setGoalOverride(t.builds?.[0]?.goal || null);
-    setBuildDetailsTab(busy ? "activity" : reviewing ? "review" : "history");
-    setActivityMode("build");
+    setGoalOverride(t.builds?.find((build) => (build.mode ?? "build") === "build")?.goal || null);
+    const run = activeRunsRef.current[t.id];
+    setBuildDetailsTab(run ? "activity" : "info");
+    setActivityMode(run?.kind ?? "build");
     setBuildDialogOpen(true);
   }
   function saveDialog() {
     if (!fTitle.trim()) return;
-    const tags = parseTagInput(fTags);
+    if (dialogKind === "bug" && (!fBugSteps.trim() || !fBugActual.trim() || !fBugExpected.trim())) {
+      notify({ kind: "error", title: "Laporan bug belum lengkap", description: "Isi langkah reproduksi, hasil aktual, dan hasil yang diharapkan." });
+      return;
+    }
+    const tags = dialogKind === "bug" ? [...new Set([...parseTagInput(fTags), "bug"])] : parseTagInput(fTags);
+    const detail = dialogKind === "bug" ? formatBugReport({ steps: fBugSteps, actual: fBugActual, expected: fBugExpected, environment: fBugEnvironment }) : fDetail.trim();
     if (editing) {
-      updateTask(project.id, editing.id, { title: fTitle.trim(), epic: fEpic.trim(), detail: fDetail.trim(), tags, priority: fPriority, status: fStatus });
+      updateTask(project.id, editing.id, { title: fTitle.trim(), epic: fEpic.trim(), detail, tags, priority: fPriority, status: fStatus });
     } else {
-      const id = addTask(project.id, { title: fTitle.trim(), epic: fEpic.trim(), detail: fDetail.trim(), tags, priority: fPriority, status: fStatus });
+      const id = addTask(project.id, { title: fTitle.trim(), epic: fEpic.trim(), detail, tags, priority: fPriority, status: fStatus });
       selectTask(id);
     }
     setDialogOpen(false);
-    notify({ kind: "success", title: editing ? "Task diperbarui" : "Task dibuat", description: fTitle.trim() });
+    notify({ kind: "success", title: dialogKind === "bug" ? editing ? "Laporan bug diperbarui" : "Laporan bug dibuat" : editing ? "Task diperbarui" : "Task dibuat", description: fTitle.trim() });
   }
 
   function move(t: ExecTask, dir: -1 | 1) {
@@ -813,54 +1301,67 @@ export function ExecutionPanel({ project }: { project: Project }) {
   }
 
   async function handleBuild(startedAtMs: number) {
-    if (selectedTaskDone || (!selected && !goalText) || !ready || busy || reviewing) return;
+    if (selectedTaskDone || (!selected && !goalText) || !ready) return;
     const buildTaskId = selected?.id ?? null;
     const logKey = buildTaskId ?? NO_TASK_KEY;
-    const isResuming = latestBuild?.status === "error" || latestBuild?.status === "stopped" || latestBuild?.status === "interrupted";
+    if (activeRunsRef.current[logKey] || (buildTaskId && selected?.builds?.some((build) => build.status === "running"))) return;
+    const previousBuild = selected?.builds?.find((build) => (build.mode ?? "build") === "build");
+    const isResuming = previousBuild?.status === "error" || previousBuild?.status === "stopped" || previousBuild?.status === "interrupted";
+    const isRebuild = Boolean(previousBuild && !isResuming);
     setActivityMode("build");
-    const goalSnapshot = isResuming && latestBuild.goal ? latestBuild.goal : goalText;
+    const goalSnapshot = isResuming && previousBuild?.goal ? previousBuild.goal : goalText;
     const modelId = buildModel || settings.defaultModel;
     const modelName = models.find((model) => model.id === modelId)?.name ?? modelId;
-    const effectiveSessionId = selected ? selected.sessionId : project.sessionId;
+    let effectiveSessionId = buildTaskId ? selected?.sessionId : project.sessionId;
+    if (buildTaskId && !effectiveSessionId) {
+      try {
+        const session = await opencode.createSession(project.directory, `${project.name} — Build ${selected?.title ?? "Task"}`);
+        effectiveSessionId = session.id;
+        setTaskSession(project.id, buildTaskId, session.id);
+      } catch (failure) {
+        setError(failure instanceof Error ? failure.message : "Gagal membuat session untuk task.");
+        return;
+      }
+    }
     setBuildDetailsTab("activity");
-    setElapsedSec(0);
-    setBusy(true);
     setError(null);
-    setEvents([]);
-    setLastDoneAt(null);
-    logsRef.current.set(logKey, []);
-    buildTaskRef.current = buildTaskId;
-    buildStartRef.current = startedAtMs;
-    const buildId = `b_${buildStartRef.current.toString(36)}`;
-    buildStatusRef.current = "running";
-    buildStatusMessageRef.current = undefined;
-    buildCountRef.current = 0;
-    buildGoalRef.current = goalSnapshot;
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setHalt(null);
+    // eslint-disable-next-line react-hooks/purity -- build ids are created in the user action handler.
+    const buildId = `b_${startedAtMs.toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    let activeSessionId = effectiveSessionId;
+    let buildStatus: TaskBuild["status"] = "running";
+    let buildStatusMessage: string | undefined;
+    let buildCount = 0;
+    const runContext: TaskRunContext = { kind: "build", runId: buildId, sessionId: effectiveSessionId, pendingInterrupt: false, stopRequested: false };
+    setTaskRun(logKey, { kind: "build", runId: buildId, startedAtMs, elapsedSec: 0, sessionId: effectiveSessionId });
+    runContextsRef.current[logKey] = runContext;
+    updateTaskEvents(logKey, []);
+    if (selectedIdRef.current === buildTaskId) setLastDoneAt(null);
     let buildSummary: string | undefined;
     let buildUsage: TokenUsage | undefined;
     let buildFailureMessage: string | undefined;
     let activityErrorNotified = false;
     const pushLog = (e: ActivityEvent) => {
-      const arr = [...(logsRef.current.get(logKey) ?? []), e];
-      logsRef.current.set(logKey, arr);
-      buildCountRef.current = arr.length;
-      setEvents(arr);
+      updateTaskEvents(logKey, (current) => [...current, e]);
+      buildCount = logsRef.current.get(logKey)?.length ?? buildCount;
       if (e.kind === "error") {
         activityErrorNotified = true;
         notify({ kind: "error", title: e.title || "Aktivitas gagal", description: e.detail });
       }
     };
     const taskLine = selected ? `Task: ${selected.title}${selected.epic ? ` (Epic: ${selected.epic})` : ""}\n${selected.detail ? `Detail: ${selected.detail}\n` : ""}` : "";
+    const previousSummary = previousBuild?.summary?.trim() || "—";
+    const rebuildSummary = previousSummary.length > 1200
+      ? `${previousSummary.slice(0, 1200)}… [ringkasan dipotong]`
+      : previousSummary;
     const prompt = isResuming
-      ? `${taskLine}Lanjutkan build dari kondisi terakhir setelah proses sebelumnya terputus. Periksa perubahan dan status kerja saat ini terlebih dahulu, jangan mengulang pekerjaan yang sudah selesai.${goalSnapshot ? `\n\nInstruksi tambahan tetap:\n${goalSnapshot}` : ""}`
+      ? `${taskLine}Lanjutkan build dari kondisi terakhir setelah proses sebelumnya terputus. Periksa perubahan dan status kerja saat ini terlebih dahulu, jangan mengulang pekerjaan yang sudah selesai. Build sebelumnya: ${previousBuild?.summary ?? previousBuild?.statusMessage ?? "tidak ada ringkasan"}.${goalSnapshot ? `\n\nInstruksi tambahan tetap:\n${goalSnapshot}` : ""}`
+      : isRebuild
+        ? `${taskLine}Periksa implementasi saat ini terhadap acceptance criteria. Pertahankan bagian yang benar; perbaiki hanya kekurangan. Jalankan pemeriksaan relevan dan laporkan file yang berubah beserta hasilnya.${goalSnapshot ? `\n\nInstruksi tambahan:\n${goalSnapshot}` : ""}\n\nKonteks build sebelumnya (bukan bukti): status ${previousBuild?.status ?? "—"}; ringkasan ${rebuildSummary}; file ${(previousBuild?.files ?? []).slice(0, 8).join(", ") || "—"}`
       : `${taskLine}${goalSnapshot ? `Instruksi tambahan:\n${goalSnapshot}\n\n` : ""}Catatan: Artefak rencana (PRD, Architecture, Epics, Sprint, Project Context) tersedia di folder project. Baca dari disk sesuai kebutuhan.\n\nSetelah selesai, tandai file yang diubah dan cara verifikasi.`;
     // Tandai task sedang dikerjakan begitu build mulai (backlog/todo -> in-progress).
     if (buildTaskId) {
       const cur = useStudio.getState().getProject(project.id)?.tasks?.find((t) => t.id === buildTaskId);
-      if (cur && (cur.status === "backlog" || cur.status === "todo")) {
+      if (cur && cur.status !== "in-progress") {
         updateTask(project.id, buildTaskId, { status: "in-progress" });
       }
       if (cur) {
@@ -874,7 +1375,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
               modelName,
               agent: settings.buildAgent,
               sessionId: effectiveSessionId,
-              startedAt: new Date(buildStartRef.current).toISOString(),
+              startedAt: new Date(startedAtMs).toISOString(),
               eventCount: 0,
               files: [],
             },
@@ -883,8 +1384,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
         });
       }
     }
-    activeSessionRef.current = effectiveSessionId ?? null;
-    setCurrentSessionId(effectiveSessionId ?? null);
+    if ((selectedIdRef.current ?? NO_TASK_KEY) === logKey) setCurrentSessionId(effectiveSessionId ?? null);
     try {
       const res = await fetch("/api/opencode/stream", {
         method: "POST",
@@ -897,7 +1397,6 @@ export function ExecutionPanel({ project }: { project: Project }) {
           agent: settings.buildAgent,
           title: `${project.name} — Build ${selected?.title ?? ""}`,
         }),
-        signal: controller.signal,
       });
       if (!res.ok || !res.body) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
@@ -926,78 +1425,79 @@ export function ExecutionPanel({ project }: { project: Project }) {
           if (eventName === "session") {
             const { sessionId } = payload as { sessionId?: string };
             if (sessionId) {
-              activeSessionRef.current = sessionId;
-              setCurrentSessionId(sessionId);
+              activeSessionId = sessionId;
+              runContextsRef.current[logKey]!.sessionId = sessionId;
+              patchTaskRun(logKey, buildId, { sessionId });
+              if ((selectedIdRef.current ?? NO_TASK_KEY) === logKey) setCurrentSessionId(sessionId);
               if (buildTaskId && sessionId !== selected?.sessionId) {
                 setTaskSession(project.id, buildTaskId, sessionId);
               } else if (!buildTaskId && sessionId !== project.sessionId) {
                 setProjectSession(project.id, sessionId);
+              }
+              if (runContext.pendingInterrupt) {
+                runContext.pendingInterrupt = false;
+                void opencode.interruptRun(sessionId).catch(() => {});
               }
             }
           } else if (eventName === "log") {
             pushLog(payload as ActivityEvent);
           } else if (eventName === "halt") {
             // Agent paused for a human decision; block the UI until answered.
-            setHalt(payload as HaltRequest);
+            patchTaskRun(logKey, buildId, { halt: payload as HaltRequest });
           } else if (eventName === "halt_resolved") {
-            setHalt(null);
+            patchTaskRun(logKey, buildId, { halt: undefined });
           } else if (eventName === "done") {
             sawDone = true;
             const donePayload = payload as { summary?: unknown; usage?: TokenUsage };
             buildSummary = typeof donePayload.summary === "string" ? donePayload.summary.trim() || undefined : undefined;
             buildUsage = donePayload.usage;
-            if (buildStatusRef.current === "running") {
-              buildStatusRef.current = "done";
-              setLastDoneAt(new Date().toISOString());
+            if (buildStatus === "running") {
+              buildStatus = "done";
+              if ((selectedIdRef.current ?? NO_TASK_KEY) === logKey) setLastDoneAt(new Date().toISOString());
             }
           } else if (eventName === "error") {
-            buildStatusRef.current = "error";
+            buildStatus = "error";
             const { message, usage } = payload as { message?: string; usage?: TokenUsage };
             buildFailureMessage = message ?? "Build error";
-            buildStatusMessageRef.current = buildFailureMessage;
+            buildStatusMessage = buildFailureMessage;
             buildUsage = usage;
-            setError(buildFailureMessage);
+            if ((selectedIdRef.current ?? NO_TASK_KEY) === logKey) setError(buildFailureMessage);
           } else if (eventName === "interrupted") {
             const { reason, usage } = payload as { reason?: string; usage?: TokenUsage };
-            buildStatusRef.current = "interrupted";
-            buildStatusMessageRef.current = interruptionStatusMessage(reason);
+            if (buildStatus === "running") {
+              buildStatus = runContext.stopRequested ? "stopped" : "interrupted";
+              buildStatusMessage = runContext.stopRequested ? "Run dihentikan melalui tombol Stop." : interruptionStatusMessage(reason);
+            }
             buildUsage = usage;
           }
         }
       }
-      if (!sawDone && !controller.signal.aborted && buildStatusRef.current === "running") {
-        buildStatusRef.current = "error";
+      if (!sawDone && buildStatus === "running") {
+        buildStatus = "error";
         buildFailureMessage = "Koneksi terputus sebelum build selesai. Build dapat dilanjutkan.";
-        buildStatusMessageRef.current = buildFailureMessage;
-        setError(buildFailureMessage);
-      } else if (sawDone) {
-        setLastDoneAt((v) => v ?? new Date().toISOString());
+        buildStatusMessage = buildFailureMessage;
+        if ((selectedIdRef.current ?? NO_TASK_KEY) === logKey) setError(buildFailureMessage);
+      } else if (sawDone && (selectedIdRef.current ?? NO_TASK_KEY) === logKey) {
+        setLastDoneAt((value) => value ?? new Date().toISOString());
       }
     } catch (e) {
-      if ((e as Error)?.name !== "AbortError") {
-        buildStatusRef.current = "error";
-        buildFailureMessage = e instanceof Error ? e.message : "Build failed";
-        buildStatusMessageRef.current = buildFailureMessage;
-        setError(buildFailureMessage);
-      }
+      buildStatus = runContext.stopRequested ? "stopped" : "error";
+      buildFailureMessage = e instanceof Error ? e.message : "Build failed";
+      buildStatusMessage = runContext.stopRequested ? "Run dihentikan melalui tombol Stop." : buildFailureMessage;
+      if (!runContext.stopRequested && (selectedIdRef.current ?? NO_TASK_KEY) === logKey) setError(buildFailureMessage);
     } finally {
-      if (buildStatusRef.current === "running") {
-        buildStatusRef.current = controller.signal.aborted ? "stopped" : "done";
-      }
-      if (buildStatusRef.current === "stopped" && !buildStatusMessageRef.current) {
-        buildStatusMessageRef.current = "Run dihentikan melalui tombol Stop.";
-      }
-      if (buildStatusRef.current === "done") {
-        notify({ kind: "success", title: "Build selesai", description: selected?.title });
-      } else if (buildStatusRef.current === "error" && !activityErrorNotified) {
+      if (buildStatus === "running") buildStatus = "error";
+      if (buildStatus === "done") {
+        notify({ kind: "success", title: "Build selesai", description: buildTaskId ? selected?.title : undefined });
+      } else if (buildStatus === "error" && !activityErrorNotified) {
         notify({ kind: "error", title: "Build gagal", description: buildFailureMessage ?? "Build tidak berhasil." });
-      } else if (buildStatusRef.current === "stopped") {
-        notify({ kind: "info", title: "Build dihentikan", description: selected?.title });
-      } else if (buildStatusRef.current === "interrupted") {
-        notify({ kind: "info", title: "Build terinterupsi", description: buildStatusMessageRef.current });
+      } else if (buildStatus === "stopped") {
+        notify({ kind: "info", title: "Build dihentikan", description: buildTaskId ? selected?.title : undefined });
+      } else if (buildStatus === "interrupted") {
+        notify({ kind: "info", title: "Build terinterupsi", description: buildStatusMessage });
       }
       const finishedAt = new Date().toISOString();
-      const elapsedMs = Date.now() - buildStartRef.current;
+      const elapsedMs = Date.now() - startedAtMs;
       const finalEvents = logsRef.current.get(logKey) ?? [];
       if (buildTaskId) {
         const prev = useStudio.getState().getProject(project.id)?.tasks?.find((t) => t.id === buildTaskId)?.builds ?? [];
@@ -1005,19 +1505,19 @@ export function ExecutionPanel({ project }: { project: Project }) {
           builds: [
             {
               id: buildId,
-              goal: buildGoalRef.current,
+              goal: goalSnapshot,
               summary: buildSummary,
-              status: buildStatusRef.current,
+              status: buildStatus,
               model: modelId,
               modelName,
               agent: settings.buildAgent,
-              sessionId: activeSessionRef.current ?? effectiveSessionId ?? undefined,
+              sessionId: activeSessionId ?? effectiveSessionId ?? undefined,
               usage: buildUsage,
-              statusMessage: buildStatusMessageRef.current,
-              startedAt: new Date(buildStartRef.current).toISOString(),
+              statusMessage: buildStatusMessage,
+              startedAt: new Date(startedAtMs).toISOString(),
               finishedAt,
               elapsedMs,
-              eventCount: finalEvents.length,
+              eventCount: Math.max(buildCount, finalEvents.length),
               files: extractFiles(finalEvents),
             },
             ...prev.filter((build) => build.id !== buildId),
@@ -1025,49 +1525,72 @@ export function ExecutionPanel({ project }: { project: Project }) {
         });
         // Build sukses -> task otomatis ke review agar siap dicek/QA.
         // Gagal / dihentikan -> status dibiarkan agar bisa diulang.
-        if (buildStatusRef.current === "done") {
+        if (buildStatus === "done") {
           const cur = useStudio.getState().getProject(project.id)?.tasks?.find((t) => t.id === buildTaskId);
           if (cur && (cur.status === "backlog" || cur.status === "todo" || cur.status === "in-progress")) {
             updateTask(project.id, buildTaskId, { status: "review" });
           }
         }
       }
-      setBusy(false);
-      setHalt(null);
-      abortRef.current = null;
+      finishTaskRun(logKey, buildId);
     }
   }
 
   async function handleImplementationReview() {
-    if (!selected || selectedTaskDone || !ready || busy || reviewing) return;
+    if (!selected || selectedTaskDone || !ready || activeRunsRef.current[selected.id] || selected.builds?.some((build) => build.status === "running")) return;
     const task = selected;
     const reviewModel = buildModel || settings.defaultModel;
-    const controller = new AbortController();
     const reviewStartedAt = new Date();
     const reviewStartedAtMs = reviewStartedAt.getTime();
     // eslint-disable-next-line react-hooks/purity -- runId dibuat sekali per aksi review (event handler), bukan saat render.
     const runId = `rv_${reviewStartedAtMs.toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-    const sessionId = task.sessionId;
-    activeSessionRef.current = sessionId ?? null;
-    setCurrentSessionId(sessionId ?? null);
-    reviewAbortRef.current = controller;
-    activeReviewRunRef.current = runId;
-    setReviewing(true);
-    setReviewError(null);
-    setActivityMode("review");
+    let sessionId = task.sessionId;
+    if (!sessionId) {
+      try {
+        const session = await opencode.createSession(project.directory, `${project.name} — Review ${task.title}`);
+        sessionId = session.id;
+        setTaskSession(project.id, task.id, session.id);
+      } catch (failure) {
+        setReviewError(failure instanceof Error ? failure.message : "Gagal membuat session review.");
+        return;
+      }
+    }
+    let activeSessionId = sessionId;
+    const runContext: TaskRunContext = { kind: "review", runId, sessionId, pendingInterrupt: false, stopRequested: false };
+    if (selectedIdRef.current === task.id) setCurrentSessionId(sessionId ?? null);
+    setTaskRun(task.id, { kind: "review", runId, startedAtMs: reviewStartedAtMs, elapsedSec: 0, sessionId });
+    runContextsRef.current[task.id] = runContext;
+    updateTask(project.id, task.id, {
+      status: "review",
+      builds: [
+        {
+          id: runId,
+          mode: "review",
+          goal: `Review implementation — ${task.title}`,
+          status: "running",
+          model: reviewModel,
+          modelName: models.find((model) => model.id === reviewModel)?.name ?? reviewModel,
+          agent: settings.buildAgent,
+          sessionId,
+          startedAt: reviewStartedAt.toISOString(),
+          eventCount: 0,
+          files: [],
+        },
+        ...(task.builds ?? []),
+      ],
+    });
+    if (selectedIdRef.current === task.id) setReviewError(null);
+    if (selectedIdRef.current === task.id) setActivityMode("review");
     // Ikuti alur build: langsung buka tab Activity agar log realtime terlihat.
     // Kesimpulan review HANYA ditulis setelah event `done` dari stream OpenCode.
-    setBuildDetailsTab("activity");
-    setEvents([]);
-    setHalt(null);
+    if (selectedIdRef.current === task.id) setBuildDetailsTab("activity");
+    updateTaskEvents(task.id, []);
     let reviewSummary: string | undefined;
     let reviewUsage: TokenUsage | undefined;
     let reviewStatus: "running" | "done" | "error" | "stopped" | "interrupted" = "running";
     let reviewStatusMessage: string | undefined;
     try {
-      // Referensi build untuk prompt harus run mode build terakhir, bukan entry
-      // review sebelumnya — agar review memeriksa kode, bukan review lama.
-      const lastBuildForPrompt = (task.builds ?? []).find((b) => (b.mode ?? "build") === "build") ?? task.builds?.[0];
+      const lastBuildForPrompt = (task.builds ?? []).find((build) => (build.mode ?? "build") === "build") ?? task.builds?.[0];
       const prompt = [
         "Review apakah task ini benar-benar sudah diimplementasikan pada repository saat ini.",
         "Bersikap read-only: JANGAN mengubah file, JANGAN menjalankan perintah yang mengubah state (no write/edit/commit), hanya baca file dan jalankan perintah baca/test bila perlu.",
@@ -1080,34 +1603,22 @@ export function ExecutionPanel({ project }: { project: Project }) {
         `Detail dan acceptance criteria:\n${task.detail || "(tidak ada)"}`,
         `Build terakhir (mode build, bukan review lama):\nStatus: ${lastBuildForPrompt?.status ?? "belum ada"}\nInstruksi: ${lastBuildForPrompt?.goal ?? "(tidak ada)"}\nSummary agen: ${lastBuildForPrompt?.summary ?? "(tidak ada)"}\nFile tercatat: ${(lastBuildForPrompt?.files ?? []).join(", ") || "(tidak ada)"}\nReview sebelumnya (jangan jadikan bukti, hanya konteks):\n${task.implementationReview ? `Verdict: ${task.implementationReview.verdict}\n${task.implementationReview.summary}` : "(belum ada)"}`,
       ].join("\n\n") + (goalOverride?.trim() ? `\n\nKonteks tambahan dari user:\n${goalOverride.trim()}` : "");
-      setEvents([
-        { kind: "info", title: `Review dimulai — ${task.title}`, detail: `Run: ${runId}\nSession: ${sessionId ?? "baru"}\nModel: ${reviewModel}` },
+      updateTaskEvents(task.id, [
+        { kind: "info", title: `Review dimulai — ${task.title}`, detail: `Run: ${runId}\nSession: ${sessionId}\nModel: ${reviewModel}` },
       ]);
-      const res = await fetch("/api/opencode/stream", {
+      const response = await fetch("/api/opencode/stream", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          directory: project.directory,
-          sessionId,
-          prompt,
-          model: reviewModel,
-          agent: settings.buildAgent,
-          title: `Implementation review — ${task.title}`,
-        }),
-        signal: controller.signal,
+        body: JSON.stringify({ directory: project.directory, sessionId, prompt, model: reviewModel, agent: settings.buildAgent, title: `Implementation review — ${task.title}` }),
       });
-      if (!res.ok || !res.body) {
-        const data = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(data?.error ?? `Request failed (${res.status})`);
+      if (!response.ok || !response.body) {
+        const data = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? `Request failed (${response.status})`);
       }
-      const reader = res.body.getReader();
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let sawDone = false;
-      const pushLog = (e: ActivityEvent) => {
-        if (activeReviewRunRef.current !== runId) return;
-        setEvents((prev) => [...prev, e]);
-      };
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1124,50 +1635,51 @@ export function ExecutionPanel({ project }: { project: Project }) {
           if (!dataStr) continue;
           let payload: unknown;
           try { payload = JSON.parse(dataStr); } catch { continue; }
-          if (activeReviewRunRef.current !== runId) continue;
           if (eventName === "session") {
-            const { sessionId: sid } = payload as { sessionId?: string };
-            if (sid) {
-              activeSessionRef.current = sid;
-              setCurrentSessionId(sid);
-              if (sid !== task.sessionId) setTaskSession(project.id, task.id, sid);
+            const { sessionId: nextSessionId } = payload as { sessionId?: string };
+            if (nextSessionId) {
+              activeSessionId = nextSessionId;
+              runContext.sessionId = nextSessionId;
+              patchTaskRun(task.id, runId, { sessionId: nextSessionId });
+              if (selectedIdRef.current === task.id) setCurrentSessionId(nextSessionId);
+              if (nextSessionId !== task.sessionId) setTaskSession(project.id, task.id, nextSessionId);
+              if (runContext.pendingInterrupt) void opencode.interruptRun(nextSessionId).catch(() => {});
             }
           } else if (eventName === "log") {
-            pushLog(payload as ActivityEvent);
+            updateTaskEvents(task.id, (previous) => [...previous, payload as ActivityEvent]);
           } else if (eventName === "halt") {
-            setHalt(payload as HaltRequest);
+            patchTaskRun(task.id, runId, { halt: payload as HaltRequest });
           } else if (eventName === "halt_resolved") {
-            setHalt(null);
+            patchTaskRun(task.id, runId, { halt: undefined });
           } else if (eventName === "done") {
             sawDone = true;
-            const dp = payload as { summary?: unknown; usage?: TokenUsage };
-            reviewSummary = typeof dp.summary === "string" ? dp.summary.trim() || undefined : undefined;
-            reviewUsage = dp.usage;
+            const result = payload as { summary?: unknown; usage?: TokenUsage };
+            reviewSummary = typeof result.summary === "string" ? result.summary.trim() || undefined : undefined;
+            reviewUsage = result.usage;
             if (reviewStatus === "running") reviewStatus = "done";
           } else if (eventName === "error") {
             reviewStatus = "error";
-            const em = payload as { message?: string; usage?: TokenUsage };
-            reviewStatusMessage = em.message ?? "Review error";
-            reviewUsage = em.usage;
-            setReviewError(reviewStatusMessage);
+            const result = payload as { message?: string; usage?: TokenUsage };
+            reviewStatusMessage = result.message ?? "Review error";
+            reviewUsage = result.usage;
+            if (selectedIdRef.current === task.id) setReviewError(reviewStatusMessage);
           } else if (eventName === "interrupted") {
-            const im = payload as { reason?: string; usage?: TokenUsage };
-            reviewStatus = "interrupted";
-            reviewStatusMessage = interruptionStatusMessage(im.reason);
-            reviewUsage = im.usage;
+            const result = payload as { reason?: string; usage?: TokenUsage };
+            reviewStatus = runContext.stopRequested ? "stopped" : "interrupted";
+            reviewStatusMessage = runContext.stopRequested ? "Review dihentikan melalui tombol Stop." : interruptionStatusMessage(result.reason);
+            reviewUsage = result.usage;
           }
         }
       }
-      if (activeReviewRunRef.current !== runId) return;
-      if (!sawDone && !controller.signal.aborted && reviewStatus === "running") {
+      if (!sawDone && reviewStatus === "running") {
         reviewStatus = "error";
         reviewStatusMessage = "Koneksi terputus sebelum review selesai. Review belum disimpulkan — jalankan ulang.";
-        setReviewError(reviewStatusMessage);
+        if (selectedIdRef.current === task.id) setReviewError(reviewStatusMessage);
       }
       if (sawDone && reviewStatus === "done" && reviewSummary) {
         // Summary SSE kadang hanya kalimat penutup — ambil teks penuh sesi agar
         // verdict tidak hilang (penyebab IMPLEMENTED terbaca UNCLEAR).
-        const finalSessionId = activeSessionRef.current ?? sessionId ?? undefined;
+        const finalSessionId = activeSessionId ?? sessionId ?? undefined;
         let verdictSource = reviewSummary;
         try {
           if (finalSessionId) {
@@ -1200,7 +1712,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
           model: reviewModel,
           modelName: models.find((m) => m.id === reviewModel)?.name ?? reviewModel,
           agent: settings.buildAgent,
-          sessionId: activeSessionRef.current ?? sessionId ?? undefined,
+          sessionId: activeSessionId ?? sessionId ?? undefined,
           usage: reviewUsage,
           statusMessage: `Verdict review: ${review.verdict}`,
           startedAt: reviewStartedAt.toISOString(),
@@ -1209,31 +1721,31 @@ export function ExecutionPanel({ project }: { project: Project }) {
           eventCount: 0,
           files: [],
         };
-        setEvents((prev) => {
+        updateTaskEvents(task.id, (prev) => {
           entry.eventCount = prev.length;
           entry.files = extractFiles(prev);
           return [...prev, { kind: "done", title: `Review selesai · ${review.verdict}`, detail: `Run: ${runId}\n${review.summary}` }];
         });
         updateTask(project.id, task.id, {
           implementationReview: review,
-          builds: [entry, ...(task.builds ?? [])],
+          builds: [entry, ...(task.builds ?? []).filter((build) => build.id !== runId)],
         });
-        setBuildDetailsTab("review");
+        if (selectedIdRef.current === task.id) setBuildDetailsTab("review");
         notify({ kind: "success", title: `Review selesai: ${review.verdict}`, description: task.title });
       } else if (reviewStatus !== "running") {
         const doneAt = new Date();
-        const aborted = controller.signal.aborted;
+        const aborted = runContext.stopRequested;
         const entry: TaskBuild = {
           id: runId,
           mode: "review",
           goal: `Review implementation — ${task.title}`,
           summary: reviewStatusMessage ?? reviewSummary ?? "Review tidak selesai.",
-          status: aborted ? "stopped" : reviewStatus === "interrupted" ? "interrupted" : "error",
+          status: aborted || reviewStatus === "stopped" ? "stopped" : reviewStatus === "interrupted" ? "interrupted" : "error",
           statusMessage: aborted ? "Review dihentikan melalui tombol Stop." : reviewStatusMessage,
           model: reviewModel,
           modelName: models.find((m) => m.id === reviewModel)?.name ?? reviewModel,
           agent: settings.buildAgent,
-          sessionId: activeSessionRef.current ?? sessionId ?? undefined,
+          sessionId: activeSessionId ?? sessionId ?? undefined,
           usage: reviewUsage,
           startedAt: reviewStartedAt.toISOString(),
           finishedAt: doneAt.toISOString(),
@@ -1241,20 +1753,20 @@ export function ExecutionPanel({ project }: { project: Project }) {
           eventCount: 0,
           files: [],
         };
-        setEvents((prev) => {
+        updateTaskEvents(task.id, (prev) => {
           entry.eventCount = prev.length;
           return [...prev, { kind: "error", title: "Review gagal", detail: `Run: ${runId}\n${entry.summary}` }];
         });
-        updateTask(project.id, task.id, { builds: [entry, ...(task.builds ?? [])] });
-        notify({ kind: aborted ? "info" : "error", title: aborted ? "Review dihentikan" : "Review gagal", description: aborted ? task.title : (reviewStatusMessage ?? "Review tidak selesai.") });
+        updateTask(project.id, task.id, { builds: [entry, ...(task.builds ?? []).filter((build) => build.id !== runId)] });
+        const stopped = aborted || reviewStatus === "stopped";
+        notify({ kind: stopped ? "info" : "error", title: stopped ? "Review dihentikan" : "Review gagal", description: stopped ? task.title : (reviewStatusMessage ?? "Review tidak selesai.") });
       }
     } catch (reviewFailure) {
       // Guard: error dari run lama tidak boleh menimpa run baru.
-      if (activeReviewRunRef.current !== runId) return;
-      const aborted = reviewFailure instanceof Error && reviewFailure.name === "AbortError";
+      const aborted = runContext.stopRequested;
       const message = aborted ? "Review dihentikan." : reviewFailure instanceof Error ? reviewFailure.message : "Review gagal dijalankan.";
-      setReviewError(message);
-      setEvents((prev) => [
+      if (selectedIdRef.current === task.id) setReviewError(message);
+      updateTaskEvents(task.id, (prev) => [
         ...prev,
         { kind: "error", title: "Review gagal", detail: `Run: ${runId}\n${message}` },
       ]);
@@ -1269,48 +1781,50 @@ export function ExecutionPanel({ project }: { project: Project }) {
         model: reviewModel,
         modelName: models.find((model) => model.id === reviewModel)?.name ?? reviewModel,
         agent: settings.buildAgent,
-        sessionId: activeSessionRef.current ?? sessionId ?? undefined,
+        sessionId: activeSessionId ?? sessionId ?? undefined,
         startedAt: reviewStartedAt.toISOString(),
         finishedAt: reviewFinishedAt.toISOString(),
         elapsedMs: reviewFinishedAt.getTime() - reviewStartedAtMs,
         eventCount: 0,
         files: [],
       };
-      setEvents((prev) => {
+      updateTaskEvents(task.id, (prev) => {
         failedReviewBuild.eventCount = prev.length;
         return prev;
       });
-      updateTask(project.id, task.id, { builds: [failedReviewBuild, ...(task.builds ?? [])] });
+      const latestBuilds = useStudio.getState().getProject(project.id)?.tasks?.find((item) => item.id === task.id)?.builds ?? task.builds ?? [];
+      updateTask(project.id, task.id, { builds: [failedReviewBuild, ...latestBuilds.filter((build) => build.id !== runId)] });
       notify({ kind: aborted ? "info" : "error", title: aborted ? "Review dihentikan" : "Review gagal", description: aborted ? task.title : message });
     } finally {
       // Hanya run aktif yang boleh membuka kunci waiting state.
-      if (activeReviewRunRef.current === runId) {
-        activeReviewRunRef.current = null;
-        if (reviewAbortRef.current === controller) reviewAbortRef.current = null;
-        setReviewing(false);
-      }
+      finishTaskRun(task.id, runId);
     }
   }
 
   function handleStopReview() {
-    if (!reviewAbortRef.current) return;
-    reviewAbortRef.current.abort();
-    activeReviewRunRef.current = null;
+    const run = activeRunsRef.current[selectedRunKey];
+    const context = runContextsRef.current[selectedRunKey];
+    if (!run || run.kind !== "review" || !context) {
+      const sessionId = selectedPersistedRun?.sessionId ?? selected?.sessionId ?? project.sessionId;
+      if (selectedPersistedRun?.mode === "review" && sessionId) void opencode.interruptRun(sessionId).catch((failure) => setReviewError(failure instanceof Error ? failure.message : "Gagal menghentikan review."));
+      return;
+    }
+    context.stopRequested = true;
     setReviewError("Review dihentikan.");
-    setReviewing(false);
-    setHalt(null);
+    const sessionId = context.sessionId ?? run.sessionId;
+    if (sessionId) void opencode.interruptRun(sessionId).catch((failure) => setReviewError(failure instanceof Error ? failure.message : "Gagal menghentikan review."));
+    else context.pendingInterrupt = true;
   }
 
   async function handleDeleteSession() {
     const sessionId = selected
-      ? selected.sessionId ?? (buildTaskRef.current === selected.id ? currentSessionId : null)
+      ? selected.sessionId ?? activeRunsRef.current[selected.id]?.sessionId ?? currentSessionId
       : currentSessionId ?? project.sessionId;
     if (!sessionId || !project.directory) return;
     try {
       await opencode.deleteSession(project.directory, sessionId);
       if (selected) setTaskSession(project.id, selected.id, undefined);
       else clearProjectSession(project.id);
-      activeSessionRef.current = null;
       setCurrentSessionId(null);
       setError(null);
       notify({ kind: "success", title: "Session OpenCode dihapus" });
@@ -1322,13 +1836,18 @@ export function ExecutionPanel({ project }: { project: Project }) {
   }
 
   function handleStop() {
-    if (buildStatusRef.current === "running") {
-      buildStatusRef.current = "stopped";
-      buildStatusMessageRef.current = "Run dihentikan melalui tombol Stop.";
+    const run = activeRunsRef.current[selectedRunKey];
+    const context = runContextsRef.current[selectedRunKey];
+    if (!run || run.kind !== "build" || !context) {
+      const sessionId = selectedPersistedRun?.sessionId ?? selected?.sessionId ?? project.sessionId;
+      if (selectedPersistedRun && selectedPersistedRun.mode !== "review" && sessionId) void opencode.interruptRun(sessionId).catch((failure) => setError(failure instanceof Error ? failure.message : "Gagal menghentikan build."));
+      return;
     }
-    abortRef.current?.abort();
-    setBusy(false);
-    setHalt(null);
+    context.stopRequested = true;
+    const sessionId = context.sessionId ?? run.sessionId;
+    if (sessionId) void opencode.interruptRun(sessionId).catch((failure) => setError(failure instanceof Error ? failure.message : "Gagal menghentikan build."));
+    else context.pendingInterrupt = true;
+    patchTaskRun(selectedRunKey, run.runId, { halt: undefined });
   }
 
   // Resolve a halt the agent paused on: approve/reject a tool permission or
@@ -1337,9 +1856,9 @@ export function ExecutionPanel({ project }: { project: Project }) {
   // keduanya sekarang memakai /api/opencode/stream yang sama.
   async function handleHaltAnswer(answer: HaltAnswer) {
     const current = halt;
-    const sessionId = activeSessionRef.current;
+    const sessionId = selectedRun?.sessionId ?? selected?.sessionId ?? currentSessionId;
     if (!current || !sessionId || answeringHalt) return;
-    setAnsweringHalt(true);
+    setAnsweringHaltByTask((previous) => ({ ...previous, [selectedRunKey]: true }));
     setError(null);
     try {
       if (answer.kind === "permission") {
@@ -1351,14 +1870,14 @@ export function ExecutionPanel({ project }: { project: Project }) {
       } else {
         await opencode.replyForm({ sessionId, id: current.id, answer: answer.answer });
       }
-      setHalt(null);
+      if (selectedRun) patchTaskRun(selectedRunKey, selectedRun.runId, { halt: undefined });
       notify({ kind: "success", title: "Jawaban dikirim ke agen" });
     } catch (e) {
       const message = e instanceof Error ? e.message : "Gagal mengirim jawaban";
       setError(message);
       notify({ kind: "error", title: "Gagal mengirim jawaban", description: message });
     } finally {
-      setAnsweringHalt(false);
+      setAnsweringHaltByTask((previous) => ({ ...previous, [selectedRunKey]: false }));
     }
   }
 
@@ -1452,9 +1971,71 @@ export function ExecutionPanel({ project }: { project: Project }) {
         </div>
       )}
 
+      {/* Backlog — strip horizontal swipable di atas board, maks BOARD_LIMIT + lihat semua */}
+      <Card role="region" aria-label="Backlog" className={`gap-0 overflow-hidden border-amber-500/40 bg-amber-500/[0.06] py-0 shadow-md ring-1 ring-amber-500/20 dark:bg-amber-400/[0.07] ${selected?.status === "backlog" ? "border-primary/60 ring-primary/30" : ""}`}>
+        <CardHeader className="gap-1 border-b border-amber-500/25 bg-gradient-to-r from-amber-500/20 via-amber-500/10 to-transparent p-3 pb-2 dark:from-amber-400/20 dark:via-amber-400/10">
+          <CardTitle className="flex items-center justify-between text-xs">
+            <span className="flex items-center gap-1.5 font-bold tracking-wide text-amber-700 uppercase dark:text-amber-300"><KanbanSquare className="size-3.5" />Backlog</span>
+            <span className="flex items-center gap-1.5">
+              <Badge className="border-amber-600/30 bg-amber-500/20 text-[10px] font-bold text-amber-800 tabular-nums dark:bg-amber-400/20 dark:text-amber-200">{backlogAll.length}</Badge>
+              <Button size="icon" variant="outline" className="size-6" aria-label="Geser backlog ke kiri" title="Geser ke kiri" disabled={backlogAll.length === 0} onClick={() => scrollBacklog(-1)}><ChevronLeft className="size-3.5" /></Button>
+              <Button size="icon" variant="outline" className="size-6" aria-label="Geser backlog ke kanan" title="Geser ke kanan" disabled={backlogAll.length === 0} onClick={() => scrollBacklog(1)}><ChevronRight className="size-3.5" /></Button>
+            </span>
+          </CardTitle>
+          <CardDescription className="text-[11px] text-amber-800/80 dark:text-amber-200/70">Ide / story belum masuk sprint — geser horizontal atau pakai tombol panah</CardDescription>
+        </CardHeader>
+        <CardContent className="px-3 pt-2.5 pb-3">
+          {backlogAll.length === 0 && <p className="text-muted-foreground rounded-md border border-dashed p-2 text-center text-[11px]">Kosong</p>}
+          {backlogAll.length > 0 && (
+            <div ref={backlogRef} className="flex snap-x snap-mandatory items-stretch gap-2 overflow-x-auto scroll-smooth pb-1 [-ms-overflow-style:none] [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1.5">
+              {backlogItems.map((t) => (
+                <div key={t.id} className="flex w-[270px] min-w-[260px] max-w-[300px] shrink-0 snap-start">
+                  <div className="w-full"><TaskCard t={t} fixedHeight selected={selectedId === t.id} {...runningPropsFor(t.id)} {...cardHandlers} /></div>
+                </div>
+              ))}
+              {backlogRest > 0 && (
+                <button
+                  type="button"
+                  onClick={() => openList("backlog")}
+                  className="text-muted-foreground hover:text-foreground hover:border-primary/40 flex min-h-[172px] w-[160px] shrink-0 snap-start flex-col items-center justify-center rounded-lg border border-dashed px-2 py-1.5 text-center text-[11px] font-medium transition-colors"
+                >
+                  +{backlogRest} lainnya<br />lihat semua
+                </button>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card role="region" aria-label="Bug dan fix" className="gap-0 overflow-hidden border-rose-500/35 bg-rose-500/[0.04] py-0 shadow-sm">
+        <CardHeader className="gap-1 border-b border-rose-500/20 bg-gradient-to-r from-rose-500/15 via-rose-500/[0.06] to-transparent p-3 pb-2">
+          <CardTitle className="flex items-center justify-between text-xs">
+            <span className="flex items-center gap-1.5 font-bold tracking-wide text-rose-700 uppercase dark:text-rose-300"><Bug className="size-3.5" />Bug / Fix</span>
+            <span className="flex items-center gap-1.5">
+              <Badge variant="outline" className="border-rose-600/30 text-[10px] font-bold tabular-nums">{bugFixTasks.length}</Badge>
+              <Button size="sm" variant="outline" className="h-7 gap-1 px-2 text-[11px]" onClick={openNewBug}><Plus className="size-3.5" />Tambah</Button>
+            </span>
+          </CardTitle>
+          <CardDescription className="text-[11px]">Bug / fix bertag #bug atau #fix yang belum masuk sprint.</CardDescription>
+        </CardHeader>
+        <CardContent className="px-3 pt-2.5 pb-3">
+          {bugFixTasks.length === 0 ? (
+            <p className="text-muted-foreground rounded-md border border-dashed p-2 text-center text-[11px]">Belum ada bug atau fix.</p>
+          ) : (
+            <div className="flex snap-x snap-mandatory items-stretch gap-2 overflow-x-auto scroll-smooth pb-1 [-ms-overflow-style:none] [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1.5">
+              {bugFixTasks.map((task) => (
+                <div key={task.id} className="flex w-[270px] min-w-[260px] max-w-[300px] shrink-0 snap-start">
+                  <div className="w-full"><TaskCard t={task} fixedHeight selected={selectedId === task.id} {...runningPropsFor(task.id)} {...cardHandlers} /></div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Kanban — ringkas, maks BOARD_LIMIT kartu per kolom, sisanya di dialog */}
-      <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-5">
-        {COLUMNS.map((col) => {
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {BOARD_COLUMNS.map((col) => {
           const all = visibleTasks.filter((t) => t.status === col.id);
           const items = all.slice(0, BOARD_LIMIT);
           const rest = all.length - items.length;
@@ -1470,75 +2051,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
               <CardContent className="space-y-1.5 px-3 pb-3">
                 {all.length === 0 && <p className="text-muted-foreground rounded-md border border-dashed p-2 text-center text-[11px]">Kosong</p>}
                 {items.map((t) => (
-                  <div
-                    key={t.id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => openBuildDialog(t)}
-                    onKeyDown={(e) => {
-                      if (e.target !== e.currentTarget) return;
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        openBuildDialog(t);
-                      }
-                    }}
-                    className={`cursor-pointer rounded-lg border px-2 py-1.5 text-left transition-colors hover:bg-accent ${selectedId === t.id ? "border-primary/50 bg-accent" : "bg-card"}`}
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <p className="min-w-0 flex-1 truncate text-xs font-semibold">{t.title}</p>
-                      <button
-                        type="button"
-                        title="Klik untuk ganti prioritas"
-                        disabled={t.status === "done"}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const order: TaskPriority[] = ["high", "medium", "low"];
-                          const next = order[(order.indexOf(t.priority ?? "medium") + 1) % order.length];
-                          updateTask(project.id, t.id, { priority: next });
-                        }}
-                        className={`shrink-0 rounded px-1 py-0.5 text-[10px] font-bold ${(t.priority ?? "medium") === "high" ? "bg-red-500/15 text-red-600 dark:text-red-400" : (t.priority ?? "medium") === "low" ? "bg-muted text-muted-foreground" : "bg-amber-500/15 text-amber-700 dark:text-amber-400"}`}
-                      >
-                        {PRIORITY_LABEL[t.priority ?? "medium"]}
-                      </button>
-                    </div>
-                    {t.epic && <p className="text-muted-foreground truncate text-[11px]">{t.epic}</p>}
-                    {(t.tags ?? []).length > 0 && (
-                      <div className="mt-0.5 flex flex-wrap gap-1">
-                        {(t.tags ?? []).slice(0, 4).map((tag) => (
-                          <Badge key={tag} variant="outline" className="px-1 py-0 text-[10px]">#{tag}</Badge>
-                        ))}
-                      </div>
-                    )}
-                    {t.detail && <p className="text-muted-foreground mt-0.5 line-clamp-1 text-[11px]">{t.detail}</p>}
-                    {t.sessionId && (
-                      <p className="text-emerald-600 dark:text-emerald-400 mt-0.5 flex items-center gap-1 text-[10px] font-medium">
-                        <span className="size-1.5 rounded-full bg-emerald-500" /> Session terisolasi
-                      </p>
-                    )}
-                    {(t.builds ?? [])[0] && (
-                      <p className="text-muted-foreground mt-0.5 truncate text-[10px] tabular-nums">
-                        {(t.builds ?? [])[0].status === "done" ? "✔" : (t.builds ?? [])[0].status === "error" ? "✖" : "■"} build {formatElapsed((t.builds ?? [])[0].elapsedMs)}{(t.builds ?? [])[0].files.length > 0 ? ` · ${(t.builds ?? [])[0].files.length} file` : ""}
-                      </p>
-                    )}
-                    <div className="mt-1 flex items-center gap-0.5">
-                      {t.status === "done" && (
-                        <Button size="sm" variant="outline" className="h-6 gap-1 px-2 text-[10px]" onClick={(e) => { e.stopPropagation(); updateTask(project.id, t.id, { status: "review" }); }}>
-                          <RotateCcw className="size-3" /> Buka kembali
-                        </Button>
-                      )}
-                      <span className="flex-1" />
-                      <Button size="icon" variant="ghost" className="size-6" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); openEdit(t); }}><Pencil className="size-3.5" /></Button>
-                      <Button size="icon" variant="ghost" className="size-6" title="Arsipkan task" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); handleArchiveTask(t.id); }}><Archive className="size-3.5" /></Button>
-                      <Button size="icon" variant="ghost" className="size-6 text-destructive" title="Pindahkan ke sampah" disabled={t.status === "done"} onClick={(e) => { e.stopPropagation(); handleDeleteTask(t.id); }}><Trash2 className="size-3.5" /></Button>
-                    </div>
-                    <div className="mt-1 flex items-center justify-between rounded-md bg-muted/70 px-1.5 py-1">
-                      <span className="text-muted-foreground text-[10px]">Ganti status</span>
-                      <div className="flex items-center gap-1">
-                        <Button size="icon" variant="outline" className="size-6 bg-background" aria-label="Pindah ke status sebelumnya" title="Pindah ke status sebelumnya" disabled={t.status === "done" || COLUMNS[0].id === t.status} onClick={(e) => { e.stopPropagation(); move(t, -1); }}><ChevronLeft className="size-3.5" /></Button>
-                        <Button size="icon" variant="outline" className="size-6 bg-background" aria-label="Pindah ke status berikutnya" title="Pindah ke status berikutnya" disabled={t.status === "done" || COLUMNS[COLUMNS.length - 1].id === t.status} onClick={(e) => { e.stopPropagation(); move(t, 1); }}><ChevronRight className="size-3.5" /></Button>
-                      </div>
-                    </div>
-                  </div>
+                  <TaskCard key={t.id} t={t} selected={selectedId === t.id} {...runningPropsFor(t.id)} {...cardHandlers} />
                 ))}
                 {rest > 0 && (
                   <Button size="sm" variant="ghost" className="h-7 w-full text-[11px]" onClick={() => openList(col.id)}>
@@ -1556,23 +2069,46 @@ export function ExecutionPanel({ project }: { project: Project }) {
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="flex max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-3xl flex-col overflow-hidden">
           <DialogHeader className="shrink-0">
-            <DialogTitle>{editing ? "Edit task" : "Task baru"}</DialogTitle>
-            <DialogDescription>Task tersimpan di papan Eksekusi project ini.</DialogDescription>
+            <DialogTitle>{dialogKind === "bug" ? editing ? "Edit laporan bug" : "Laporan bug baru" : editing ? "Edit task" : "Task baru"}</DialogTitle>
+            <DialogDescription>{dialogKind === "bug" ? "Catat kondisi yang dapat direproduksi agar masalah mudah diverifikasi dan diperbaiki." : "Task tersimpan di papan Eksekusi project ini."}</DialogDescription>
           </DialogHeader>
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
-                <Label>Judul</Label>
-                <Input value={fTitle} onChange={(e) => setFTitle(e.target.value)} placeholder="cth. Story 1.2 — User bisa membuat task" />
+                <Label>{dialogKind === "bug" ? "Ringkasan bug" : "Judul"}</Label>
+                <Input value={fTitle} onChange={(e) => setFTitle(e.target.value)} placeholder={dialogKind === "bug" ? "cth. Tombol Simpan tidak merespons" : "cth. Story 1.2 — User bisa membuat task"} />
               </div>
-              <div className="space-y-1.5">
-                <Label>Epic</Label>
-                <Input value={fEpic} onChange={(e) => setFEpic(e.target.value)} placeholder="Opsional" />
-              </div>
-              <div className="space-y-1.5 sm:col-span-2">
-                <Label>Detail / acceptance criteria</Label>
-                <Textarea value={fDetail} onChange={(e) => setFDetail(e.target.value)} rows={4} placeholder="AC1: …&#10;AC2: …" />
-              </div>
+              {dialogKind === "task" && (
+                <div className="space-y-1.5">
+                  <Label>Epic</Label>
+                  <Input value={fEpic} onChange={(e) => setFEpic(e.target.value)} placeholder="Opsional" />
+                </div>
+              )}
+              {dialogKind === "bug" ? (
+                <>
+                  <div className="space-y-1.5 sm:col-span-2">
+                    <Label>Langkah reproduksi <span className="text-destructive">*</span></Label>
+                    <Textarea value={fBugSteps} onChange={(e) => setFBugSteps(e.target.value)} rows={3} placeholder={"1. Buka halaman ...\n2. Pilih ...\n3. Klik ..."} />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Hasil aktual <span className="text-destructive">*</span></Label>
+                    <Textarea value={fBugActual} onChange={(e) => setFBugActual(e.target.value)} rows={3} placeholder="Apa yang terjadi?" />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Hasil yang diharapkan <span className="text-destructive">*</span></Label>
+                    <Textarea value={fBugExpected} onChange={(e) => setFBugExpected(e.target.value)} rows={3} placeholder="Apa yang seharusnya terjadi?" />
+                  </div>
+                  <div className="space-y-1.5 sm:col-span-2">
+                    <Label>Lingkungan <span className="text-muted-foreground">(opsional)</span></Label>
+                    <Input value={fBugEnvironment} onChange={(e) => setFBugEnvironment(e.target.value)} placeholder="Browser, OS, versi aplikasi, atau kondisi data" />
+                  </div>
+                </>
+              ) : (
+                <div className="space-y-1.5 sm:col-span-2">
+                  <Label>Detail / acceptance criteria</Label>
+                  <Textarea value={fDetail} onChange={(e) => setFDetail(e.target.value)} rows={4} placeholder="AC1: …&#10;AC2: …" />
+                </div>
+              )}
               <div className="space-y-1.5 sm:col-span-2">
                 <Label>Tag</Label>
                 <Input value={fTags} onChange={(e) => setFTags(e.target.value)} placeholder="Pisahkan dengan koma" />
@@ -1583,12 +2119,12 @@ export function ExecutionPanel({ project }: { project: Project }) {
                 )}
               </div>
               <div className="space-y-1.5">
-                <Label>Prioritas</Label>
+                <Label>{dialogKind === "bug" ? "Tingkat dampak" : "Prioritas"}</Label>
                 <Select value={fPriority} onValueChange={(value) => setFPriority(value as TaskPriority)}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     {(["high", "medium", "low"] as TaskPriority[]).map((priority) => (
-                      <SelectItem key={priority} value={priority}>{PRIORITY_LABEL[priority]}</SelectItem>
+                      <SelectItem key={priority} value={priority}>{dialogKind === "bug" ? { high: "Tinggi · P1", medium: "Sedang · P2", low: "Rendah · P3" }[priority] : PRIORITY_LABEL[priority]}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
@@ -1915,7 +2451,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{canResumeBuild ? "Lanjutkan build?" : "Jalankan build?"}</DialogTitle>
+            <DialogTitle>{canResumeBuild ? "Lanjutkan build?" : hasBuildHistory ? "Build ulang?" : "Jalankan build?"}</DialogTitle>
             <DialogDescription>
               Agen akan mengerjakan dan mengubah file di folder project. Pastikan instruksi sudah benar.
             </DialogDescription>
@@ -1932,7 +2468,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
           <DialogFooter>
             <Button variant="ghost" onClick={() => setConfirmOpen(false)}>Batal</Button>
             <Button onClick={(event) => { setConfirmOpen(false); void handleBuild(performance.timeOrigin + event.timeStamp); }} disabled={selectedTaskDone || (!selected && !goalText) || !ready}>
-              <Rocket className="size-4" /> {canResumeBuild ? "Lanjutkan" : "Jalankan"}
+              <Rocket className="size-4" /> {canResumeBuild ? "Lanjutkan" : hasBuildHistory ? "Build ulang" : "Jalankan"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -2074,7 +2610,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
                     ) : (
                       <Button className="w-full sm:col-span-2" onClick={() => runMode === "review" ? void handleImplementationReview() : setConfirmOpen(true)} disabled={selectedTaskDone || (!selected && (runMode === "review" || !goalText)) || !ready}>
                         {runMode === "review" ? <Search className="size-4" /> : <Rocket className="size-4" />}
-                        {runMode === "review" ? "Jalankan review" : canResumeBuild ? "Lanjutkan build" : "Jalankan build"}
+                        {runMode === "review" ? "Jalankan review" : canResumeBuild ? "Lanjutkan build" : hasBuildHistory ? "Build ulang" : "Jalankan build"}
                       </Button>
                     )}
                     {!busy && lastDoneAt && !error && <span className="text-xs text-emerald-600 sm:col-span-2">Selesai {new Date(lastDoneAt).toLocaleTimeString()}</span>}
@@ -2109,12 +2645,89 @@ export function ExecutionPanel({ project }: { project: Project }) {
                 </div>
                 {/* Kolom kanan: tabs riwayat + review + aktivitas, full height */}
                 <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
-                  <Tabs value={buildDetailsTab} onValueChange={(value) => setBuildDetailsTab(value as "history" | "activity" | "review")} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                    <TabsList className="grid w-full shrink-0 grid-cols-3">
+                  <Tabs value={buildDetailsTab} onValueChange={(value) => setBuildDetailsTab(value as "info" | "history" | "activity" | "review")} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                    <TabsList className="grid w-full shrink-0 grid-cols-4">
+                      <TabsTrigger value="info" disabled={!selected}>Info Task</TabsTrigger>
                       <TabsTrigger value="history" disabled={busy || reviewing}>Riwayat build ({(selected.builds ?? []).length})</TabsTrigger>
                       <TabsTrigger value="review" disabled={busy}>Review</TabsTrigger>
                       <TabsTrigger value="activity">Aktivitas</TabsTrigger>
                     </TabsList>
+                    <TabsContent value="info" className="mt-2 min-h-0 flex-1 flex-col overflow-y-auto data-[state=active]:flex data-[state=inactive]:hidden">
+                      {!selected ? (
+                        <p className="text-muted-foreground rounded-md border border-dashed p-4 text-center text-xs">Pilih task untuk melihat informasi.</p>
+                      ) : (
+                        <div className="space-y-4 pb-2">
+                          <header className="rounded-md border bg-muted/30 p-4">
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div className="min-w-0 flex-1">
+                                <p className="text-muted-foreground mb-1 text-[10px] font-semibold uppercase tracking-wide">Task</p>
+                                <h3 className="break-words text-base font-semibold leading-snug">{selected.title}</h3>
+                                {selected.epic && <p className="text-muted-foreground mt-1 text-xs">{selected.epic}</p>}
+                              </div>
+                              <div className="flex shrink-0 flex-wrap gap-1.5">
+                                <Badge variant={selected.status === "done" ? "secondary" : "outline"}>{TASK_STATUS_LABEL[selected.status]}</Badge>
+                                <Badge variant={selected.priority === "high" ? "destructive" : selected.priority === "low" ? "outline" : "secondary"}>{PRIORITY_LABEL[selected.priority ?? "medium"]}</Badge>
+                              </div>
+                            </div>
+                            {(selected.tags ?? []).length > 0 && (
+                              <div className="mt-3 flex flex-wrap gap-1.5 border-t pt-3">
+                                {selected.tags.map((tag) => <Badge key={tag} variant="outline" className="font-normal">#{tag}</Badge>)}
+                              </div>
+                            )}
+                          </header>
+
+                          {selected.detail ? (
+                            <section className="space-y-2">
+                              <h4 className="text-muted-foreground text-[10px] font-semibold uppercase tracking-wide">Detail &amp; acceptance criteria</h4>
+                              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{selected.detail}</p>
+                            </section>
+                          ) : (
+                            <p className="text-muted-foreground text-xs">Belum ada detail atau acceptance criteria.</p>
+                          )}
+
+                          <dl className="grid grid-cols-2 gap-x-4 gap-y-3 border-y py-3">
+                            <div>
+                              <dt className="text-muted-foreground text-[10px]">Run tercatat</dt>
+                              <dd className="mt-0.5 text-sm font-medium tabular-nums">{selected.builds?.length ?? 0}</dd>
+                            </div>
+                            <div>
+                              <dt className="text-muted-foreground text-[10px]">Durasi terakhir</dt>
+                              <dd className="mt-0.5 text-sm font-medium tabular-nums">{latestBuild?.status === "running" ? `${Math.floor(elapsedSec / 60)}:${String(elapsedSec % 60).padStart(2, "0")} berjalan` : formatElapsed(latestBuild?.elapsedMs)}</dd>
+                            </div>
+                            <div className="col-span-2 min-w-0">
+                              <dt className="text-muted-foreground text-[10px]">Session OpenCode</dt>
+                              <dd className="mt-0.5 truncate font-mono text-[11px]">{selected.sessionId ?? "Belum ada session"}</dd>
+                            </div>
+                          </dl>
+
+                          {latestBuild && (
+                            <section className="space-y-2">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <h4 className="text-muted-foreground text-[10px] font-semibold uppercase tracking-wide">Run terakhir</h4>
+                                <Badge variant={latestBuild.status === "done" ? "secondary" : latestBuild.status === "running" ? "default" : "outline"}>
+                                  {latestBuild.mode === "review" ? "Review" : "Build"} · {latestBuild.status === "done" ? "Sukses" : latestBuild.status === "running" ? "Berjalan" : latestBuild.status === "error" ? "Gagal" : latestBuild.status === "stopped" ? "Dihentikan" : "Terinterupsi"}
+                                </Badge>
+                              </div>
+                              <p className="text-muted-foreground text-xs">{latestBuild.modelName ?? latestBuild.model ?? "Model tidak tercatat"}{latestBuild.startedAt ? ` · ${new Date(latestBuild.startedAt).toLocaleString()}` : ""}</p>
+                              {(latestBuild.summary || latestBuild.statusMessage) && <p className="whitespace-pre-wrap break-words text-xs leading-relaxed">{latestBuild.summary ?? latestBuild.statusMessage}</p>}
+                            </section>
+                          )}
+
+                          {selected.implementationReview && (
+                            <section className="space-y-2 border-t pt-3">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <h4 className="text-muted-foreground text-[10px] font-semibold uppercase tracking-wide">Hasil review</h4>
+                                <Badge variant={selected.implementationReview.verdict === "implemented" ? "secondary" : "outline"}>
+                                  {selected.implementationReview.verdict === "implemented" ? "Terimplementasi" : selected.implementationReview.verdict === "partial" ? "Parsial" : selected.implementationReview.verdict === "not_implemented" ? "Belum terimplementasi" : "Belum jelas"}
+                                </Badge>
+                              </div>
+                              <p className="text-muted-foreground text-[10px]">{new Date(selected.implementationReview.reviewedAt).toLocaleString()}</p>
+                              <div className="md-preview text-xs"><ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>{selected.implementationReview.summary}</ReactMarkdown></div>
+                            </section>
+                          )}
+                        </div>
+                      )}
+                    </TabsContent>
                     <TabsContent value="activity" className="mt-2 min-h-0 flex-1 flex-col gap-2 overflow-hidden data-[state=active]:flex data-[state=inactive]:hidden">
                       <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-2.5 py-1.5">
                         <div className="min-w-0">
@@ -2308,7 +2921,7 @@ export function ExecutionPanel({ project }: { project: Project }) {
         halt={halt}
         busy={answeringHalt}
         onSubmit={handleHaltAnswer}
-        onClose={() => setHalt(null)}
+        onClose={() => { if (selectedRun) patchTaskRun(selectedRunKey, selectedRun.runId, { halt: undefined }); }}
       />
     </div>
   );
